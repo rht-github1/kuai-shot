@@ -1,0 +1,5 @@
+APP_NAME = "快截图"
+APP_ID = "kuai-shot"
+HOTKEY = "<Ctrl><Alt>a"
+HOTKEY_LABEL = "Ctrl+Alt+A"
+VERSION = "1.0.0"

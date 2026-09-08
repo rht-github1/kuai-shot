@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+import json
+import os
+import socket
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+os.environ.setdefault("KUAI_SHOT_HOME", str(ROOT))
+
+
+def _socket_path() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/tmp/runtime-{os.getuid()}")
+    return os.path.join(runtime, "kuai-shot.sock")
+
+
+def send_command(cmd: str, timeout: float = 0.8) -> bool:
+    path = _socket_path()
+    if not os.path.exists(path):
+        return False
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(path)
+        sock.sendall((json.dumps({"cmd": cmd}) + "\n").encode("utf-8"))
+        sock.close()
+        return True
+    except OSError:
+        return False
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if any(arg in {"capture", "--capture"} for arg in args):
+        if send_command("capture"):
+            return 0
+    elif "--quit" in args or (args and args[0] == "quit"):
+        if send_command("quit"):
+            return 0
+        return 0
+    elif args and args[0] == "ping":
+        return 0 if send_command("ping") else 1
+    elif args and args[0] == "daemon":
+        pass
+    elif send_command("ping"):
+        return 0
+
+    from kuai_shot.app import run
+
+    return run(sys.argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
