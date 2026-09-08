@@ -101,8 +101,7 @@ class PortalGrabber:
 
     def wait_image(self, box: dict, timeout: float = 10.0) -> QImage:
         path = _uri_to_path(self.wait_box(box, timeout))
-        image = load_image_raw(path)
-        _safe_unlink(path)
+        image = _load_captured_file(path)
         if image is None:
             raise CaptureError("截图文件无效")
         return image
@@ -118,18 +117,56 @@ def start_grabber() -> PortalGrabber:
     return _grabber
 
 
+def _on_wayland() -> bool:
+    return (os.environ.get("XDG_SESSION_TYPE") or "").lower() == "wayland"
+
+
 def capture_fullscreen(include_cursor: bool = False) -> QImage:
-    del include_cursor
     errors: list[str] = []
-    for fn in (_capture_portal, _capture_gnome_shell, _capture_qt):
+    fns = [_capture_mutter]
+    if not include_cursor:
+        fns.append(_capture_portal)
+    fns.append(_capture_gnome_shell)
+    if not _on_wayland():
+        fns.append(_capture_qt)
+    for fn in fns:
         try:
-            image = fn()
+            image = fn(include_cursor) if fn is _capture_mutter else fn()
             if image is not None and not image.isNull():
+                if _mostly_blank(image):
+                    errors.append(f"{fn.__name__}: blank")
+                    continue
                 return image
             errors.append(f"{fn.__name__}: empty")
         except Exception as exc:
             errors.append(f"{fn.__name__}: {exc}")
     raise CaptureError("无法抓取屏幕：" + " | ".join(errors))
+
+
+def _mostly_blank(image: QImage) -> bool:
+    w, h = image.width(), image.height()
+    if w < 8 or h < 8:
+        return True
+    step_x = max(1, w // 24)
+    step_y = max(1, h // 16)
+    total = 0
+    bright = 0
+    dark = 0
+    for y in range(0, h, step_y):
+        for x in range(0, w, step_x):
+            c = image.pixelColor(x, y)
+            total += 1
+            if c.red() > 245 and c.green() > 245 and c.blue() > 245:
+                bright += 1
+            if c.red() < 10 and c.green() < 10 and c.blue() < 10:
+                dark += 1
+    return total > 0 and (bright / total > 0.96 or dark / total > 0.96)
+
+
+def _capture_mutter(include_cursor: bool = False) -> QImage | None:
+    from .mutter_capture import capture_monitors
+
+    return capture_monitors(include_cursor=include_cursor)
 
 
 def _capture_portal() -> QImage | None:
@@ -140,9 +177,20 @@ def _capture_portal() -> QImage | None:
         from .portal_helper import grab_uri
 
         uri = grab_uri()
-    path = _uri_to_path(uri)
+    return _load_captured_file(_uri_to_path(uri))
+
+
+def _load_captured_file(path: str) -> QImage | None:
     image = load_image_raw(path)
-    _safe_unlink(path)
+    if not path:
+        return image
+    try:
+        resolved = Path(path).resolve()
+        cache = cache_dir().resolve()
+        if str(resolved).startswith(str(cache)) or str(resolved).startswith("/tmp"):
+            _safe_unlink(path)
+    except Exception:
+        pass
     return image
 
 

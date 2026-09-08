@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from . import HOTKEY
+from . import APP_ID, APP_NAME, HOTKEY
 
 
 GNOME_SCHEMA = "org.gnome.settings-daemon.plugins.media-keys"
@@ -70,24 +70,38 @@ def register_gnome_hotkey(command: str, name: str = "快截图") -> None:
     subprocess.run(["gsettings", "set", schema, "binding", HOTKEY], check=False)
 
 
+def _desktop_text(exec_cmd: str, icon: str | None, autostart: bool) -> str:
+    icon_line = f"Icon={icon}\n" if icon else ""
+    extra = ""
+    if autostart:
+        extra = "X-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=2\n"
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Version=1.0\n"
+        f"Name={APP_NAME}\n"
+        f"StartupWMClass={APP_ID}\n"
+        "Comment=区域截图工具\n"
+        "Exec=" + exec_cmd + "\n"
+        + icon_line
+        + "Terminal=false\n"
+        "StartupNotify=false\n"
+        "Categories=Utility;Graphics;\n"
+        + extra
+    )
+
+
 def write_autostart(exec_cmd: str, icon: str | None = None) -> Path:
     from .paths import autostart_desktop_path
 
     path = autostart_desktop_path()
-    icon_line = f"Icon={icon}\n" if icon else ""
-    path.write_text(
-        "[Desktop Entry]\n"
-        "Type=Application\n"
-        "Version=1.0\n"
-        "Name=快截图\n"
-        "Comment=开机自启动的区域截图工具\n"
-        "Exec=" + exec_cmd + "\n"
-        + icon_line
-        + "Terminal=false\n"
-        "X-GNOME-Autostart-enabled=true\n"
-        "X-GNOME-Autostart-Delay=2\n"
-        "StartupNotify=false\n"
-        "Categories=Utility;Graphics;\n",
-        encoding="utf-8",
-    )
+    path.write_text(_desktop_text(exec_cmd, icon, autostart=True), encoding="utf-8")
+    return path
+
+
+def write_application_desktop(exec_cmd: str, icon: str | None = None) -> Path:
+    from .paths import applications_desktop_path
+
+    path = applications_desktop_path()
+    path.write_text(_desktop_text(exec_cmd, icon, autostart=False), encoding="utf-8")
     return path

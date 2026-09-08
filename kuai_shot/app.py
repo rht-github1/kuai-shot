@@ -8,13 +8,14 @@ from PyQt5.QtCore import QObject, Qt, QTimer
 from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
-from . import APP_NAME, HOTKEY_LABEL
-from .capture import CaptureError, capture_fullscreen, start_grabber
+from . import APP_ID, APP_NAME, HOTKEY_LABEL
+from .capture import CaptureError, capture_fullscreen
 from .display import probe_monitors, split_by_screens
-from .hotkey import register_gnome_hotkey, write_autostart
+from .hotkey import register_gnome_hotkey, write_application_desktop, write_autostart
 from .ipc import CommandServer, send_command
-from .overlay_gtk import OverlaySession, ensure_gtk, pump_gtk
+from .overlay import OverlaySession
 from .paths import install_root
+from .permission import grant_screenshot_permission
 
 
 class ShotApp(QObject):
@@ -24,14 +25,8 @@ class ShotApp(QObject):
         self.session: OverlaySession | None = None
         self.pins: list = []
         self._busy = False
-        self._portal_job: dict | None = None
         self.server = CommandServer(self._on_ipc)
         self.server.start()
-        start_grabber()
-        ensure_gtk()
-        self._glib = QTimer()
-        self._glib.timeout.connect(pump_gtk)
-        self._glib.start(5)
         self.tray = self._make_tray()
         qt.screenAdded.connect(lambda *_: None)
         qt.screenRemoved.connect(self._on_screens_changed)
@@ -78,38 +73,17 @@ class ShotApp(QObject):
 
     def _on_ipc(self, cmd: str) -> None:
         if cmd == "capture":
-            self._arm_capture()
+            QTimer.singleShot(0, self.start_capture)
         elif cmd == "quit":
             QTimer.singleShot(0, self.quit)
 
-    def _arm_capture(self) -> None:
-        if self._busy or self.session is not None:
-            return
-        if self._portal_job is None:
-            try:
-                self._portal_job = start_grabber().submit()
-            except Exception:
-                self._portal_job = None
-        QTimer.singleShot(0, self.start_capture)
-
     def start_capture(self) -> None:
-        if self.session is not None:
-            return
-        if self._busy and self._portal_job is None:
+        if self.session is not None or self._busy:
             return
         self._busy = True
         try:
             monitors = probe_monitors()
-            job = self._portal_job
-            self._portal_job = None
-            full = None
-            if job is not None:
-                try:
-                    full = start_grabber().wait_image(job)
-                except CaptureError:
-                    full = None
-            if full is None or full.isNull():
-                full = capture_fullscreen()
+            full = capture_fullscreen()
             shots = split_by_screens(full, monitors)
             if not shots:
                 raise CaptureError("没有可用的屏幕")
@@ -122,8 +96,9 @@ class ShotApp(QObject):
 
     def _on_overlay_finished(self) -> None:
         session = self.session
-        if session is not None and session.result is not None and not session.result.isNull():
-            QApplication.clipboard().setImage(session.result)
+        result = getattr(session, "result", None)
+        if result is not None and not result.isNull():
+            QApplication.clipboard().setImage(result)
         self.session = None
 
     def quit(self) -> None:
@@ -145,8 +120,10 @@ def run(argv: list[str] | None = None) -> int:
 
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    QApplication.setDesktopFileName(APP_ID)
     qt = QApplication(argv)
-    qt.setApplicationName(APP_NAME)
+    qt.setApplicationName(APP_ID)
+    qt.setApplicationDisplayName(APP_NAME)
     qt.setQuitOnLastWindowClosed(False)
 
     app = ShotApp(qt)
@@ -160,5 +137,12 @@ def run(argv: list[str] | None = None) -> int:
 
 def install_user_integration(launcher: str) -> None:
     icon = str(install_root() / "icon.png")
-    write_autostart(f"{launcher} daemon", icon if Path(icon).exists() else None)
+    icon = icon if Path(icon).exists() else None
+    write_autostart(f"{launcher} daemon", icon)
+    write_application_desktop(f"{launcher} capture", icon)
     register_gnome_hotkey(f"{launcher} capture", APP_NAME)
+    try:
+        grant_screenshot_permission()
+        print("已写入截图权限：kuai-shot")
+    except Exception as exc:
+        print(f"写入截图权限失败：{exc}")

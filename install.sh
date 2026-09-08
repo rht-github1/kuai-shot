@@ -5,18 +5,25 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 PREFIX="${PREFIX:-$HOME/.local}"
 DEST="${DEST:-$PREFIX/share/kuai-shot}"
 BIN="${BIN:-$PREFIX/bin/kuai-shot}"
+DESKTOP="${XDG_DATA_HOME:-$HOME/.local/share}/applications/kuai-shot.desktop"
 export DEST
 
-# 清掉旧的 feishu-shot 安装
-if command -v pkill >/dev/null 2>&1; then
-  pkill -f "$HOME/.local/share/feishu-shot/feishu-shot" >/dev/null 2>&1 || true
-  pkill -f "$DEST/kuai-shot" >/dev/null 2>&1 || true
-fi
+stop_old() {
+  if command -v pkill >/dev/null 2>&1; then
+    pkill -f '/share/kuai-shot/kuai-shot' >/dev/null 2>&1 || true
+    pkill -f '/share/feishu-shot/feishu-shot' >/dev/null 2>&1 || true
+    pkill -f "$DEST/kuai-shot" >/dev/null 2>&1 || true
+    pkill -f "$HOME/.local/share/kuai-shot/kuai-shot" >/dev/null 2>&1 || true
+    pkill -f "$HOME/.local/share/feishu-shot/feishu-shot" >/dev/null 2>&1 || true
+  fi
+  rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/feishu-shot.sock"
+  rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/kuai-shot.sock"
+}
+
+stop_old
 rm -f "$PREFIX/bin/feishu-shot"
 rm -rf "$PREFIX/share/feishu-shot"
 rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/feishu-shot.desktop"
-rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/feishu-shot.sock"
-rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/kuai-shot.sock"
 
 mkdir -p "$(dirname "$BIN")" "$DEST"
 if command -v rsync >/dev/null 2>&1; then
@@ -31,6 +38,7 @@ chmod +x "$DEST/kuai-shot" "$DEST/install.sh"
 cat > "$BIN" <<EOF
 #!/usr/bin/env bash
 export KUAI_SHOT_HOME="$DEST"
+export GIO_LAUNCHED_DESKTOP_FILE="$DESKTOP"
 exec python3 "$DEST/kuai-shot" "\$@"
 EOF
 chmod +x "$BIN"
@@ -71,9 +79,7 @@ install_user_integration("$BIN")
 print("已写入开机自启动和快捷键 Ctrl+Alt+A")
 PY
 
-if command -v pkill >/dev/null 2>&1; then
-  pkill -f "$DEST/kuai-shot" >/dev/null 2>&1 || true
-fi
+stop_old
 nohup "$BIN" daemon >/dev/null 2>&1 &
 echo "已安装到 $DEST"
 echo "启动命令: $BIN"

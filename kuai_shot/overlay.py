@@ -326,7 +326,7 @@ class Overlay(QWidget):
         self._redo: list[Stroke] = []
         self._draft: Stroke | None = None
 
-        flags = Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        flags = Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Window
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
@@ -376,7 +376,10 @@ class Overlay(QWidget):
         self._index = index
 
         self.show()
+        self.showFullScreen()
         self.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.OtherFocusReason)
 
     def _pixmap_1x(self, image: QImage) -> QPixmap:
         pix = QPixmap.fromImage(image)
@@ -412,6 +415,8 @@ class Overlay(QWidget):
             handle.setScreen(self.screen_obj)
         self.setGeometry(self.screen_obj.geometry())
         self.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.OtherFocusReason)
 
     def clear_selection(self) -> None:
         self._rect = QRect()

@@ -41,5 +41,11 @@ def autostart_desktop_path() -> Path:
     return path / "kuai-shot.desktop"
 
 
+def applications_desktop_path() -> Path:
+    path = Path(os.environ.get("XDG_DATA_HOME", user_home() / ".local" / "share")) / "applications"
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "kuai-shot.desktop"
+
+
 def install_root() -> Path:
     return Path(os.environ.get("KUAI_SHOT_HOME", user_home() / ".local" / "share" / "kuai-shot"))
