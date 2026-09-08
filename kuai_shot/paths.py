@@ -11,10 +11,26 @@ def user_home() -> Path:
 def pictures_dir() -> Path:
     xdg = os.environ.get("XDG_PICTURES_DIR")
     if xdg:
-        return Path(xdg)
-    pictures = user_home() / "Pictures"
-    pictures.mkdir(parents=True, exist_ok=True)
-    return pictures
+        path = Path(xdg)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    try:
+        import subprocess
+
+        out = subprocess.check_output(["xdg-user-dir", "PICTURES"], text=True, timeout=2).strip()
+        if out:
+            path = Path(out)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+    except Exception:
+        pass
+    for name in ("图片", "Pictures"):
+        path = user_home() / name
+        if path.is_dir():
+            return path
+    path = user_home() / "Pictures"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def cache_dir() -> Path:

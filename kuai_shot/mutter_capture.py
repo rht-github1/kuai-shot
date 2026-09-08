@@ -226,12 +226,16 @@ def _gst_grab(node_id: int) -> QImage:
         if not ok:
             raise MutterCaptureError("无法读取 PipeWire 帧")
         try:
-            image = QImage(mapped.data, width, height, QImage.Format_RGBA8888).copy()
+            raw = bytes(mapped.data)
         finally:
             buf.unmap(mapped)
+        stride = width * 4
+        if height > 0 and len(raw) >= width * height * 4:
+            stride = max(stride, len(raw) // height)
+        image = QImage(raw, width, height, stride, QImage.Format_RGBA8888).copy()
         if image.isNull():
             raise MutterCaptureError("PipeWire 帧无效")
-        return image
+        return image.convertToFormat(QImage.Format_RGB32)
     finally:
         pipeline.set_state(Gst.State.NULL)
 

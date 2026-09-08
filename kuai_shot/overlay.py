@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 
 from PyQt5.QtCore import QObject, QPoint, QRect, QSize, Qt, pyqtSignal
 from PyQt5.QtGui import (
@@ -450,9 +452,7 @@ class Overlay(QWidget):
     def _crop_image(self) -> QImage:
         r = self._norm_rect()
         src = self._image_rect(r)
-        img = self._image.copy(src)
-        if img.format() != QImage.Format_ARGB32:
-            img = img.convertToFormat(QImage.Format_ARGB32)
+        img = self._image.copy(src).convertToFormat(QImage.Format_RGB32)
         if self._strokes:
             painter = QPainter(img)
             painter.setRenderHint(QPainter.Antialiasing, True)
@@ -460,7 +460,7 @@ class Overlay(QWidget):
             for stroke in self._strokes:
                 self._paint_stroke(painter, stroke, QSize(img.width(), img.height()), r.size())
             painter.end()
-        return img
+        return img.copy()
 
     def _paint_stroke(self, painter: QPainter, stroke: Stroke, img_size: QSize, view_size: QSize) -> None:
         if not stroke.points:
@@ -817,18 +817,22 @@ class Overlay(QWidget):
     def _save(self) -> None:
         if self._norm_rect().width() <= 4:
             self._rect = self.rect()
-        default = pictures_dir() / "Screenshot.png"
+        image = self._export_image()
+        default = pictures_dir() / datetime.now().strftime("截图-%Y%m%d-%H%M%S.png")
         path, _ = QFileDialog.getSaveFileName(self, "保存截图", str(default), "PNG (*.png);;JPEG (*.jpg)")
         if not path:
             return
-        image = self._export_image()
-        writer = QImageWriter(path)
-        if path.lower().endswith(".jpg") or path.lower().endswith(".jpeg"):
-            writer.setQuality(95)
+        suffix = Path(path).suffix.lower()
+        if suffix in {".jpg", ".jpeg"}:
+            fmt, quality = "JPEG", 95
         else:
-            writer.setQuality(80)
-        if not writer.write(image):
-            image.save(path)
+            if suffix != ".png":
+                path += ".png"
+            fmt, quality = "PNG", -1
+        if not image.save(path, fmt, quality):
+            writer = QImageWriter(path)
+            writer.setFormat(fmt.encode())
+            writer.write(image)
         self.accepted.emit(None)
 
     def _pin(self) -> None:
