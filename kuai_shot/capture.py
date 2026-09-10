@@ -142,7 +142,7 @@ def _shots_from_frames(frames: list[dict], monitors: list[Monitor]) -> list[Scre
         if mon is None or mon.name in used:
             continue
         used.add(mon.name)
-        shots.append(ScreenShot(mon.screen, image, mon.logical))
+        shots.append(ScreenShot(mon.screen, image, mon.logical, mon.name))
     return shots
 
 

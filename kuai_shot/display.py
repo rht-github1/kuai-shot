@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from PyQt5.QtCore import QPoint, QRect, QSize
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QCursor, QGuiApplication, QImage, QPixmap, QScreen
+from PyQt5.QtCore import QPoint, QRect, QSize, Qt
+from PyQt5.QtGui import QColor, QCursor, QGuiApplication, QImage, QPixmap, QScreen
 
 
 @dataclass
@@ -12,6 +11,7 @@ class ScreenShot:
     screen: QScreen
     image: QImage
     geometry: QRect
+    name: str = ""
 
     def pixmap(self) -> QPixmap:
         pix = QPixmap.fromImage(self.image)
@@ -25,9 +25,12 @@ class Monitor:
     name: str
     logical: QRect
     scale: float
+    mode: QSize = field(default_factory=lambda: QSize(0, 0))
 
     @property
     def physical_size(self) -> QSize:
+        if self.mode.width() > 0 and self.mode.height() > 0:
+            return QSize(self.mode.width(), self.mode.height())
         return QSize(
             max(1, int(round(self.logical.width() * self.scale))),
             max(1, int(round(self.logical.height() * self.scale))),
@@ -39,48 +42,201 @@ class LayoutCandidate:
     name: str
     canvas: QSize
     crops: tuple[QRect, ...]
+    score: float = 0.0
 
 
-def _gdk_scales() -> dict[str, float]:
+def _qt_screens() -> dict[str, QScreen]:
+    found: dict[str, QScreen] = {}
+    for screen in QGuiApplication.screens() or []:
+        name = (screen.name() or "").strip()
+        if name:
+            found[name] = screen
+    return found
+
+
+def _gdk_outputs() -> list[tuple[str, QRect, float]]:
     try:
         import gi
 
         gi.require_version("Gdk", "3.0")
         from gi.repository import Gdk
-
-        display = Gdk.Display.get_default()
-        if display is None:
-            return {}
-        scales: dict[str, float] = {}
-        for i in range(display.get_n_monitors()):
-            mon = display.get_monitor(i)
-            geo = mon.get_geometry()
-            key = f"{geo.x},{geo.y},{geo.width}x{geo.height}"
-            scales[key] = float(mon.get_scale_factor() or 1)
-            model = (mon.get_model() or "").strip()
-            if model:
-                scales[model] = float(mon.get_scale_factor() or 1)
-        return scales
     except Exception:
-        return {}
+        return []
+    display = Gdk.Display.get_default()
+    if display is None:
+        return []
+    items: list[tuple[str, QRect, float]] = []
+    for i in range(display.get_n_monitors()):
+        mon = display.get_monitor(i)
+        geo = mon.get_geometry()
+        rect = QRect(geo.x, geo.y, geo.width, geo.height)
+        scale = float(mon.get_scale_factor() or 1)
+        model = (mon.get_model() or "").strip()
+        items.append((model, rect, scale))
+    return items
+
+
+def _mutter_outputs() -> list[dict]:
+    try:
+        import os
+
+        from gi.repository import Gio
+    except Exception:
+        return []
+    try:
+        addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS") or Gio.dbus_address_get_for_bus_sync(
+            Gio.BusType.SESSION, None
+        )
+        conn = Gio.DBusConnection.new_for_address_sync(
+            addr,
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+            | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+            None,
+            None,
+        )
+        proxy = Gio.DBusProxy.new_sync(
+            conn,
+            Gio.DBusProxyFlags.NONE,
+            None,
+            "org.gnome.Mutter.DisplayConfig",
+            "/org/gnome/Mutter/DisplayConfig",
+            "org.gnome.Mutter.DisplayConfig",
+            None,
+        )
+        _serial, monitors, logical, _props = proxy.call_sync(
+            "GetCurrentState", None, Gio.DBusCallFlags.NONE, 2500, None
+        ).unpack()
+    except Exception:
+        return []
+
+    modes_by_name: dict[str, QSize] = {}
+    for mon in monitors:
+        try:
+            spec = mon[0]
+            connector = str(spec[0] if isinstance(spec, (tuple, list)) else spec)
+            modes = mon[1] if len(mon) > 1 else []
+            current = QSize(0, 0)
+            for mode in modes:
+                width, height = int(mode[1]), int(mode[2])
+                props = mode[-1] if isinstance(mode[-1], dict) else {}
+                if props.get("is-current"):
+                    current = QSize(width, height)
+                    break
+                if current.width() == 0 and props.get("is-preferred"):
+                    current = QSize(width, height)
+            if current.width() == 0 and modes:
+                current = QSize(int(modes[0][1]), int(modes[0][2]))
+            if connector:
+                modes_by_name[connector] = current
+        except Exception:
+            continue
+
+    outputs: list[dict] = []
+    for item in logical:
+        try:
+            x, y = int(item[0]), int(item[1])
+            scale = float(item[2] or 1)
+            for mon in item[5]:
+                connector = str(mon[0])
+                if not connector:
+                    continue
+                outputs.append(
+                    {
+                        "name": connector,
+                        "x": x,
+                        "y": y,
+                        "scale": max(0.5, scale),
+                        "mode": modes_by_name.get(connector, QSize(0, 0)),
+                    }
+                )
+        except Exception:
+            continue
+    return outputs
+
+
+def placeholder_shots(monitors: list[Monitor] | None = None) -> list[ScreenShot]:
+    monitors = monitors or probe_monitors()
+    shots: list[ScreenShot] = []
+    for mon in monitors:
+        image = QImage(
+            max(8, mon.logical.width()),
+            max(8, mon.logical.height()),
+            QImage.Format_RGB32,
+        )
+        image.fill(QColor(18, 20, 24))
+        shots.append(ScreenShot(mon.screen, image, QRect(mon.logical), mon.name))
+    return shots
 
 
 def probe_monitors() -> list[Monitor]:
-    screens = list(QGuiApplication.screens() or [])
-    gdk = _gdk_scales()
+    qt = _qt_screens()
+    gdk = _gdk_outputs()
+    mutter = _mutter_outputs()
     monitors: list[Monitor] = []
-    for screen in screens:
-        geo = QRect(screen.geometry())
-        key = f"{geo.x()},{geo.y()},{geo.width()}x{geo.height()}"
-        scale = gdk.get(key) or gdk.get(screen.name(), 0) or float(screen.devicePixelRatio() or 1)
-        monitors.append(
-            Monitor(
-                screen=screen,
-                name=screen.name() or f"screen-{len(monitors)}",
-                logical=geo,
-                scale=max(0.5, float(scale)),
+
+    if mutter:
+        used_screens: set[int] = set()
+        for item in mutter:
+            screen = qt.get(item["name"])
+            if screen is None:
+                for other in qt.values():
+                    if id(other) in used_screens:
+                        continue
+                    g = other.geometry()
+                    if abs(g.x() - item["x"]) < 8 and abs(g.y() - item["y"]) < 8:
+                        screen = other
+                        break
+            if screen is None:
+                leftover = [s for s in qt.values() if id(s) not in used_screens]
+                screen = leftover[0] if leftover else QGuiApplication.primaryScreen()
+            if screen is None:
+                continue
+            used_screens.add(id(screen))
+            geo = QRect(screen.geometry())
+            logical = QRect(item["x"], item["y"], geo.width(), geo.height())
+            if logical.width() < 8 or logical.height() < 8:
+                logical = geo
+            monitors.append(
+                Monitor(
+                    screen=screen,
+                    name=item["name"] or screen.name() or f"screen-{len(monitors)}",
+                    logical=logical if logical.width() > 0 else geo,
+                    scale=item["scale"],
+                    mode=item["mode"],
+                )
             )
-        )
+    else:
+        for name, screen in qt.items():
+            geo = QRect(screen.geometry())
+            scale = float(screen.devicePixelRatio() or 1)
+            for model, rect, gdk_scale in gdk:
+                if abs(rect.x() - geo.x()) + abs(rect.y() - geo.y()) < 16:
+                    scale = gdk_scale
+                    break
+                if model and model == name:
+                    scale = gdk_scale
+                    break
+            monitors.append(
+                Monitor(
+                    screen=screen,
+                    name=name or f"screen-{len(monitors)}",
+                    logical=geo,
+                    scale=max(0.5, scale),
+                    mode=QSize(0, 0),
+                )
+            )
+
+    if not monitors:
+        for i, screen in enumerate(QGuiApplication.screens() or []):
+            geo = QRect(screen.geometry())
+            monitors.append(
+                Monitor(
+                    screen=screen,
+                    name=screen.name() or f"screen-{i}",
+                    logical=geo,
+                    scale=max(0.5, float(screen.devicePixelRatio() or 1)),
+                )
+            )
     monitors.sort(key=lambda m: (m.logical.y(), m.logical.x()))
     return monitors
 
@@ -98,107 +254,112 @@ def _crops_from_rects(rects: list[QRect]) -> tuple[QSize, tuple[QRect, ...]]:
     return box.size(), crops
 
 
-def _candidates(monitors: list[Monitor]) -> list[LayoutCandidate]:
-    logical = [m.logical for m in monitors]
-    items: list[LayoutCandidate] = []
-
-    size, crops = _crops_from_rects(logical)
-    items.append(LayoutCandidate("logical", size, crops))
-
-    physical_at_logical_pos = [
-        QRect(m.logical.x(), m.logical.y(), m.physical_size.width(), m.physical_size.height())
-        for m in monitors
-    ]
-    size, crops = _crops_from_rects(physical_at_logical_pos)
-    items.append(LayoutCandidate("physical-size", size, crops))
-
-    physical_scaled_pos = [
-        QRect(
-            int(round(m.logical.x() * m.scale)),
-            int(round(m.logical.y() * m.scale)),
-            m.physical_size.width(),
-            m.physical_size.height(),
-        )
-        for m in monitors
-    ]
-    size, crops = _crops_from_rects(physical_scaled_pos)
-    items.append(LayoutCandidate("physical-pos", size, crops))
-
-    common = monitors[0].scale
-    if all(abs(m.scale - common) < 0.01 for m in monitors):
-        scaled = [
-            QRect(
-                int(round(m.logical.x() * common)),
-                int(round(m.logical.y() * common)),
-                int(round(m.logical.width() * common)),
-                int(round(m.logical.height() * common)),
-            )
-            for m in monitors
-        ]
-        size, crops = _crops_from_rects(scaled)
-        items.append(LayoutCandidate("uniform-scale", size, crops))
-    return items
-
-
 def _score(canvas: QSize, image: QSize) -> float:
-    if canvas.width() <= 0 or canvas.height() <= 0:
+    if canvas.width() <= 0 or canvas.height() <= 0 or image.width() <= 0 or image.height() <= 0:
         return 1e9
     dw = abs(canvas.width() - image.width()) / image.width()
     dh = abs(canvas.height() - image.height()) / image.height()
     ar_c = canvas.width() / canvas.height()
-    ar_i = image.width() / max(1, image.height())
+    ar_i = image.width() / image.height()
     return dw + dh + abs(ar_c - ar_i) * 0.25
 
 
-def _match_single_monitor(full: QImage, monitors: list[Monitor]) -> ScreenShot | None:
+def _candidates(monitors: list[Monitor]) -> list[LayoutCandidate]:
+    image_placeholder = QSize(1, 1)
+    variants: list[tuple[str, list[QRect]]] = [
+        ("logical", [QRect(m.logical) for m in monitors]),
+        (
+            "mode-at-logical",
+            [
+                QRect(m.logical.x(), m.logical.y(), m.physical_size.width(), m.physical_size.height())
+                for m in monitors
+            ],
+        ),
+        (
+            "mode-scaled-pos",
+            [
+                QRect(
+                    int(round(m.logical.x() * m.scale)),
+                    int(round(m.logical.y() * m.scale)),
+                    m.physical_size.width(),
+                    m.physical_size.height(),
+                )
+                for m in monitors
+            ],
+        ),
+        (
+            "logical-times-scale",
+            [
+                QRect(
+                    m.logical.x(),
+                    m.logical.y(),
+                    max(1, int(round(m.logical.width() * m.scale))),
+                    max(1, int(round(m.logical.height() * m.scale))),
+                )
+                for m in monitors
+            ],
+        ),
+    ]
+    items: list[LayoutCandidate] = []
+    seen: set[tuple[int, int, tuple[tuple[int, int, int, int], ...]]] = set()
+    for name, rects in variants:
+        size, crops = _crops_from_rects(rects)
+        key = (size.width(), size.height(), tuple((c.x(), c.y(), c.width(), c.height()) for c in crops))
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(LayoutCandidate(name, size, crops, _score(size, image_placeholder)))
+    return items
+
+
+def best_layout(full: QImage, monitors: list[Monitor]) -> LayoutCandidate:
     image = QSize(full.width(), full.height())
-    for mon in monitors:
-        for size in (mon.logical.size(), mon.physical_size):
-            if _score(size, image) < 0.02:
-                return ScreenShot(screen=mon.screen, image=full, geometry=mon.logical)
-    return None
+    scored = []
+    for cand in _candidates(monitors):
+        scored.append(LayoutCandidate(cand.name, cand.canvas, cand.crops, _score(cand.canvas, image)))
+    return min(scored, key=lambda c: c.score)
+
+
+def layout_fit(full: QImage, monitors: list[Monitor] | None = None) -> float:
+    monitors = monitors or probe_monitors()
+    if not monitors or full.isNull():
+        return 1e9
+    return best_layout(full, monitors).score
 
 
 def split_by_screens(full: QImage, monitors: list[Monitor] | None = None) -> list[ScreenShot]:
+    """Crop a captured canvas using the live output graph.
+
+    There is no single-screen / multi-screen product path. One output
+    or eight: the compositor is probed now, then this frame is scored
+    against layout hypotheses. A poor score returns nothing so the
+    caller can grab each output separately instead of stretching.
+    """
     monitors = monitors or probe_monitors()
     if not monitors or full.isNull():
         return []
-    if len(monitors) == 1:
-        return [ScreenShot(monitors[0].screen, full, monitors[0].logical)]
-
-    virtual = _bounds([m.logical for m in monitors]).size()
-    image = QSize(full.width(), full.height())
-    if _score(virtual, image) > 0.2:
-        single = _match_single_monitor(full, monitors)
-        if single is not None:
-            return [single]
-
-    best = min(_candidates(monitors), key=lambda c: _score(c.canvas, image))
-    if _score(best.canvas, image) > 0.08:
-        logical = [m.logical for m in monitors]
-        _, crops = _crops_from_rects(logical)
-        sx = full.width() / max(1, _bounds(logical).width())
-        sy = full.height() / max(1, _bounds(logical).height())
-        shots = []
-        for mon, crop in zip(monitors, crops):
-            src = QRect(
-                int(round(crop.x() * sx)),
-                int(round(crop.y() * sy)),
-                max(1, int(round(crop.width() * sx))),
-                max(1, int(round(crop.height() * sy))),
-            )
-            piece = full.copy(src.intersected(QRect(0, 0, full.width(), full.height())))
-            if not piece.isNull():
-                shots.append(ScreenShot(mon.screen, piece, mon.logical))
-        return shots
-
+    best = best_layout(full, monitors)
+    if best.score > 0.15:
+        return []
+    sx = full.width() / max(1, best.canvas.width())
+    sy = full.height() / max(1, best.canvas.height())
+    if abs(sx - 1.0) < 0.02 and abs(sy - 1.0) < 0.02:
+        sx = sy = 1.0
     shots = []
     for mon, crop in zip(monitors, best.crops):
-        src = crop.intersected(QRect(0, 0, full.width(), full.height()))
-        piece = full.copy(src)
-        if piece.isNull():
+        src = QRect(
+            int(round(crop.x() * sx)),
+            int(round(crop.y() * sy)),
+            max(1, int(round(crop.width() * sx))),
+            max(1, int(round(crop.height() * sy))),
+        ).intersected(QRect(0, 0, full.width(), full.height()))
+        if src.width() < 8 or src.height() < 8:
             continue
-        shots.append(ScreenShot(mon.screen, piece, mon.logical))
+        piece = full.copy(src)
+        if not piece.isNull():
+            shots.append(ScreenShot(mon.screen, piece, mon.logical, mon.name))
+    if len(shots) != len(monitors):
+        return []
     return shots
 
 
@@ -236,18 +397,7 @@ def split_screen_under_cursor(
     monitors: list[Monitor] | None = None,
     pos: QPoint | None = None,
 ) -> list[ScreenShot]:
-    monitors = monitors or probe_monitors()
-    pos = pos or QCursor.pos()
-    shots = split_by_screens(full, monitors)
-    if not shots:
-        return []
-    mon = monitor_at(pos, monitors)
-    if mon is None:
-        return shots[:1]
-    for shot in shots:
-        if shot.screen == mon.screen or shot.geometry == mon.logical:
-            return [shot]
-    return shots[:1]
+    return split_by_screens(full, monitors)
 
 
 def ui_scale_for(size: QSize, dpr: float) -> float:

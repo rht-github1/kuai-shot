@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-from PyQt5.QtCore import QObject, Qt, QTimer
+from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -19,6 +19,8 @@ from .permission import grant_screenshot_permission
 
 
 class ShotApp(QObject):
+    ipc_cmd = pyqtSignal(str)
+
     def __init__(self, qt: QApplication):
         super().__init__()
         self.qt = qt
@@ -26,7 +28,8 @@ class ShotApp(QObject):
         self.pins: list = []
         self._busy = False
         self._portal_job: dict | None = None
-        self.server = CommandServer(self._on_ipc)
+        self.ipc_cmd.connect(self._on_ipc)
+        self.server = CommandServer(self.ipc_cmd.emit)
         self.server.start()
         start_grabber()
         ensure_gtk()
@@ -34,9 +37,9 @@ class ShotApp(QObject):
         self._glib.timeout.connect(pump_gtk)
         self._glib.start(5)
         self.tray = self._make_tray()
-        qt.screenAdded.connect(lambda *_: None)
+        qt.screenAdded.connect(self._on_screens_changed)
         qt.screenRemoved.connect(self._on_screens_changed)
-        qt.primaryScreenChanged.connect(lambda *_: None)
+        qt.primaryScreenChanged.connect(self._on_screens_changed)
 
     def _on_screens_changed(self, *_args) -> None:
         if self.session is not None:
@@ -91,16 +94,18 @@ class ShotApp(QObject):
                 self._portal_job = start_grabber().submit()
             except Exception:
                 self._portal_job = None
-        QTimer.singleShot(0, self.start_capture)
+        self.start_capture()
 
     def start_capture(self) -> None:
         if self.session is not None:
             return
-        if self._busy and self._portal_job is None:
+        if self._busy:
             return
         self._busy = True
         try:
             monitors = probe_monitors()
+            if not monitors:
+                raise CaptureError("没有可用的屏幕")
             job = self._portal_job
             self._portal_job = None
             shots = []
@@ -116,17 +121,19 @@ class ShotApp(QObject):
                 raise CaptureError("没有可用的屏幕")
             self.session = OverlaySession(shots)
             self.session.finished.connect(self._on_overlay_finished)
-        except CaptureError as exc:
-            self.tray.showMessage(APP_NAME, str(exc), QSystemTrayIcon.Warning, 4000)
-        finally:
+        except Exception as exc:
             self._busy = False
+            self.tray.showMessage(APP_NAME, str(exc), QSystemTrayIcon.Warning, 4000)
 
     def _on_overlay_finished(self) -> None:
         session = self.session
-        result = getattr(session, "result", None)
-        if result is not None and not result.isNull():
-            QApplication.clipboard().setImage(result)
+        if session is not None:
+            self.pins.extend(getattr(session, "pins", []) or [])
+            result = getattr(session, "result", None)
+            if result is not None and not result.isNull():
+                QApplication.clipboard().setImage(result)
         self.session = None
+        self._busy = False
 
     def quit(self) -> None:
         self.server.stop()
