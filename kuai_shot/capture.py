@@ -131,7 +131,7 @@ def _match_frame(name: str, monitors: list[Monitor]) -> Monitor | None:
     return None
 
 
-def _shots_from_frames(frames: list[dict], monitors: list[Monitor]) -> list[ScreenShot]:
+def shots_from_frames(frames: list[dict], monitors: list[Monitor]) -> list[ScreenShot]:
     shots: list[ScreenShot] = []
     used: set[str] = set()
     for item in frames:
@@ -166,7 +166,7 @@ def capture_shots(
     try:
         from .mutter_capture import capture_monitor_frames
 
-        shots = _shots_from_frames(capture_monitor_frames(include_cursor=include_cursor), monitors)
+        shots = shots_from_frames(capture_monitor_frames(include_cursor=include_cursor), monitors)
         if shots:
             return shots
     except Exception:

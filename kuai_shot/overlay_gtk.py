@@ -13,15 +13,18 @@ gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 from PyQt5.QtCore import QObject, QRect, pyqtSignal
-from PyQt5.QtGui import QImage, QPainter
+from PyQt5.QtGui import QImage
 
+from .compose import compose_pieces
 from .display import ScreenShot
-from .paths import pictures_dir
+from .log import event, exception
+from .paths import cache_dir, pictures_dir
+from .stitch import stitch_long
 from .windows import TopWindow, _init_atspi, list_visible_windows, window_at
 
 _GTK_READY = False
-TOOLS = ["rect", "ellipse", "arrow", "pen", "highlight", "mosaic", "text"]
-BAR_KINDS = TOOLS + ["undo", "redo", "save", "pin", "ok", "cancel"]
+TOOLS = ["rect", "ellipse", "arrow", "pen", "highlight", "mosaic", "text", "step"]
+BAR_KINDS = TOOLS + ["undo", "redo", "long", "save", "pin", "ok", "cancel"]
 HANDLE_NAMES = ("nw", "n", "ne", "e", "se", "s", "sw", "w")
 HANDLE_CURSORS = {
     "nw": "nw-resize",
@@ -75,6 +78,108 @@ def qimage_to_pixbuf(image: QImage) -> GdkPixbuf.Pixbuf:
     return src.copy()
 
 
+def _scroll_axis(ev) -> str:
+    dx = dy = 0.0
+    direction = getattr(ev, "direction", None)
+    if direction == Gdk.ScrollDirection.SMOOTH:
+        dx, dy = float(getattr(ev, "delta_x", 0) or 0), float(getattr(ev, "delta_y", 0) or 0)
+    elif direction == Gdk.ScrollDirection.LEFT:
+        dx = -1
+    elif direction == Gdk.ScrollDirection.RIGHT:
+        dx = 1
+    elif direction == Gdk.ScrollDirection.UP:
+        dy = -1
+    elif direction == Gdk.ScrollDirection.DOWN:
+        dy = 1
+    return "h" if abs(dx) > abs(dy) else "v"
+
+
+def _scroll_delta(ev) -> tuple[float, float]:
+    dx = dy = 0.0
+    direction = getattr(ev, "direction", None)
+    if direction == Gdk.ScrollDirection.SMOOTH:
+        dx = float(getattr(ev, "delta_x", 0) or 0)
+        dy = float(getattr(ev, "delta_y", 0) or 0)
+    elif direction == Gdk.ScrollDirection.LEFT:
+        dx = -1
+    elif direction == Gdk.ScrollDirection.RIGHT:
+        dx = 1
+    elif direction == Gdk.ScrollDirection.UP:
+        dy = -1
+    elif direction == Gdk.ScrollDirection.DOWN:
+        dy = 1
+    return dx, dy
+
+
+_CLIP_HOLD: dict[str, object] = {"image": None, "mime": None, "png": None}
+
+
+def _offer_wl_copy(png: bytes) -> None:
+    import shutil
+    import subprocess
+
+    exe = shutil.which("wl-copy")
+    if not exe:
+        event("clip.wl", ok=0, reason="missing")
+        return
+    proc = subprocess.Popen(
+        [exe, "--type", "image/png"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        proc.communicate(png, timeout=8)
+        event("clip.wl", ok=1 if proc.returncode == 0 else 0, bytes=len(png))
+    except Exception as exc:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        exception("clip.wl", exc)
+
+
+def copy_image(image: QImage) -> None:
+    if image is None or image.isNull():
+        event("clip.skip", reason="empty")
+        return
+    held = image.convertToFormat(QImage.Format_ARGB32).copy()
+    _CLIP_HOLD["image"] = held
+    event("clip.begin", w=held.width(), h=held.height())
+    png = b""
+    try:
+        from PyQt5.QtCore import QBuffer, QByteArray, QIODevice, QMimeData
+        from PyQt5.QtGui import QClipboard
+        from PyQt5.QtWidgets import QApplication
+
+        buf = QBuffer()
+        buf.open(QIODevice.WriteOnly)
+        held.save(buf, "PNG")
+        png = bytes(buf.data())
+        _CLIP_HOLD["png"] = png
+        try:
+            path = cache_dir() / "last-clip.png"
+            path.write_bytes(png)
+            event("clip.file", path=str(path), bytes=len(png))
+        except Exception as exc:
+            exception("clip.file", exc)
+        qt = QApplication.instance()
+        if qt is not None:
+            mime = QMimeData()
+            mime.setImageData(held)
+            mime.setData("image/png", QByteArray(png))
+            _CLIP_HOLD["mime"] = mime
+            qt.clipboard().setMimeData(mime, QClipboard.Clipboard)
+            event("clip.qt", bytes=len(png))
+        else:
+            event("clip.qt", ok=0, reason="no-qapp")
+    except Exception as exc:
+        exception("clip.qt", exc)
+    if png:
+        _offer_wl_copy(png)
+
+
 def pixbuf_to_qimage(pixbuf: GdkPixbuf.Pixbuf) -> QImage:
     width, height = pixbuf.get_width(), pixbuf.get_height()
     stride = pixbuf.get_rowstride()
@@ -123,6 +228,7 @@ class Stroke:
     width: int
     points: list[tuple[float, float]] = field(default_factory=list)
     text: str = ""
+    font: int = 18
 
 
 class PinWindow:
@@ -207,9 +313,14 @@ class GtkOverlay:
         self._last_ev = None
         self._bar_slots = None
         self._color_slots = None
+        self._hud = (0.0, 0.0, 0.0, 0.0)
+        self._entry: Gtk.Entry | None = None
+        self._text_img: tuple[float, float] | None = None
+        self._shape_key = None
 
         screen = Gdk.Screen.get_default()
         idx, gdk_mon = monitor_index_for(shot.geometry, shot.name, session._used_monitors)
+        self.gdk_screen = screen
         self.mon_geo = screen.get_monitor_geometry(idx)
         self.mon_idx = idx
         self.mon_sf = float(gdk_mon.get_scale_factor() if gdk_mon is not None else 1)
@@ -221,6 +332,14 @@ class GtkOverlay:
         self.win.set_accept_focus(True)
         self.win.set_resizable(True)
         self.win.set_type_hint(Gdk.WindowTypeHint.NORMAL)
+        rgba = screen.get_rgba_visual()
+        if rgba is not None:
+            self.win.set_visual(rgba)
+        self.win.set_app_paintable(True)
+        try:
+            self.win.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0, 0, 0, 0))
+        except Exception:
+            pass
         mask = (
             Gdk.EventMask.BUTTON_PRESS_MASK
             | Gdk.EventMask.BUTTON_RELEASE_MASK
@@ -229,12 +348,18 @@ class GtkOverlay:
             | Gdk.EventMask.KEY_PRESS_MASK
             | Gdk.EventMask.ENTER_NOTIFY_MASK
             | Gdk.EventMask.SCROLL_MASK
+            | Gdk.EventMask.SMOOTH_SCROLL_MASK
         )
         self.da = Gtk.DrawingArea()
+        self.da.set_app_paintable(True)
         self.da.set_can_focus(True)
         self.da.set_hexpand(True)
         self.da.set_vexpand(True)
-        self.win.add(self.da)
+        self.layer = Gtk.Overlay()
+        self.layer.set_app_paintable(True)
+        self.layer.add(self.da)
+        self.win.add(self.layer)
+        self.layer.connect("draw", self._on_layer_draw)
         self.win.add_events(mask)
         self.da.add_events(mask)
         self.da.connect("draw", self._on_draw)
@@ -242,10 +367,13 @@ class GtkOverlay:
             widget.connect("button-press-event", self._on_press)
             widget.connect("button-release-event", self._on_release)
             widget.connect("motion-notify-event", self._on_motion)
+            widget.connect("scroll-event", self._on_scroll)
         self.win.connect("enter-notify-event", self._on_enter)
         self.win.connect("key-press-event", self._on_key)
         self.win.connect("delete-event", self._on_delete)
         self.win.connect("realize", self._on_realize)
+        self.win.connect("configure-event", self._on_configure)
+        self.da.connect("size-allocate", self._on_allocate)
         self.win.move(self.mon_geo.x, self.mon_geo.y)
         self.win.set_default_size(self.mon_geo.width, self.mon_geo.height)
         self.win.resize(self.mon_geo.width, self.mon_geo.height)
@@ -299,8 +427,10 @@ class GtkOverlay:
             | Gdk.EventMask.KEY_PRESS_MASK
             | Gdk.EventMask.ENTER_NOTIFY_MASK
             | Gdk.EventMask.SCROLL_MASK
+            | Gdk.EventMask.SMOOTH_SCROLL_MASK
         )
         self._set_cursor("crosshair")
+        self._apply_input_shape()
         self.win.present()
         self.da.grab_focus()
         return False
@@ -375,28 +505,40 @@ class GtkOverlay:
         cr.fill()
         if w > 2 and h > 2:
             cr.set_source_rgb(0.20, 0.44, 1)
-            cr.set_line_width(2)
-            cr.rectangle(x, y, w, h)
+            cr.set_line_width(3 if self.session.long_mode else 2)
+            if self.session.long_mode:
+                cr.rectangle(x - 1.5, y - 1.5, w + 3, h + 3)
+            else:
+                cr.rectangle(x, y, w, h)
             cr.stroke()
-            cr.set_source_rgb(1, 1, 1)
-            for hx, hy in self._handle_points(x, y, w, h).values():
-                cr.rectangle(hx - 4, hy - 4, 8, 8)
-            cr.fill()
+            if not self.session.long_mode:
+                cr.set_source_rgb(1, 1, 1)
+                for hx, hy in self._handle_points(x, y, w, h).values():
+                    cr.rectangle(hx - 4, hy - 4, 8, 8)
+                cr.fill()
             cr.set_source_rgb(1, 1, 1)
             cr.select_font_face("Sans")
             cr.set_font_size(16)
             cr.move_to(x, max(18, y - 8))
             box = self.session.sel_rect()
-            cr.show_text(f"{box.width()} × {box.height()}" if box else f"{int(w)} × {int(h)}")
-        for stroke in self.strokes + ([self.draft] if self.draft else []):
-            self._draw_stroke(cr, stroke)
+            if self.session.long_mode and box:
+                cr.show_text(f"长图已锁定  {box.width()} × {box.height()}")
+            else:
+                cr.show_text(f"{box.width()} × {box.height()}" if box else f"{int(w)} × {int(h)}")
+        if not self.session.long_mode:
+            for stroke in self.strokes + ([self.draft] if self.draft else []):
+                self._draw_stroke(cr, stroke)
         cr.restore()
         self._draw_hint(cr, vis_w)
+        if not self.session.long_mode:
+            self._draw_hud(cr, vis_w, vis_h)
         if w > 2 and self.session.toolbar_owner() is self:
             self._draw_bar(cr, vis_w, vis_h, sx, sy, x, y, w, h)
         else:
             self._bar_slots = None
             self._color_slots = None
+        if self.session.long_mode:
+            self._maybe_apply_shape()
         return False
 
     def _handle_points(self, x, y, w, h) -> dict[str, tuple[float, float]]:
@@ -431,14 +573,125 @@ class GtkOverlay:
     def _draw_hint(self, cr, win_w):
         if self is not self.session.overlays[0]:
             return
-        text = "拖拽跨屏选区  ·  点窗口套住  ·  八向缩放  ·  Enter复制  ·  钉住不关文件"
+        if self.session.long_mode:
+            text = "选区已锁定  ·  保存 / ✓ 与平时相同"
+        else:
+            text = "拖拽选区  ·  点窗口  ·  选区后点「长图」  ·  文字直接输入  ·  [ ]线宽/字号"
         cr.set_source_rgba(0.17, 0.18, 0.21, 0.92)
-        cr.rectangle(16, 16, min(win_w - 32, 640), 28)
+        cr.rectangle(16, 16, min(win_w - 32, 720), 28)
         cr.fill()
         cr.set_source_rgb(0.91, 0.92, 0.93)
         cr.set_font_size(13)
         cr.move_to(24, 35)
         cr.show_text(text)
+
+    def _pixel(self, x: float, y: float) -> tuple[int, int, int]:
+        ix, iy = int(x), int(y)
+        if ix < 0 or iy < 0 or ix >= self.img_w or iy >= self.img_h:
+            return (0, 0, 0)
+        nchan = 4 if self.pixbuf.get_has_alpha() else 3
+        stride = self.pixbuf.get_rowstride()
+        data = self.pixbuf.get_pixels()
+        i = iy * stride + ix * nchan
+        if i + 2 >= len(data):
+            return (0, 0, 0)
+        return (data[i], data[i + 1], data[i + 2])
+
+    def _draw_hud(self, cr, win_w: float, win_h: float) -> None:
+        vx, vy, ix, iy = self._hud
+        if vx <= 0 and vy <= 0:
+            return
+        if self._hit_bar(vx, vy) is not None:
+            return
+        zoom, src = 8, 9
+        half = src // 2
+        box = src * zoom
+        px = vx + 18
+        py = vy + 18
+        if px + box + 110 > win_w:
+            px = vx - box - 18
+        if py + box + 36 > win_h:
+            py = vy - box - 36
+        px = max(8, min(px, win_w - box - 8))
+        py = max(8, min(py, win_h - box - 8))
+        cr.set_source_rgba(0.07, 0.09, 0.12, 0.92)
+        self._round_rect(cr, px - 4, py - 4, box + 8, box + 32, 8)
+        cr.fill()
+        cr.save()
+        cr.rectangle(px, py, box, box)
+        cr.clip()
+        cr.translate(px, py)
+        cr.scale(zoom, zoom)
+        Gdk.cairo_set_source_pixbuf(cr, self.pixbuf, -ix + half, -iy + half)
+        cr.paint()
+        cr.restore()
+        cr.set_source_rgb(0.20, 0.44, 1)
+        cr.set_line_width(1)
+        cr.rectangle(px, py, box, box)
+        cr.stroke()
+        cr.move_to(px + box / 2, py)
+        cr.line_to(px + box / 2, py + box)
+        cr.move_to(px, py + box / 2)
+        cr.line_to(px + box, py + box / 2)
+        cr.stroke()
+        r, g, b = self._pixel(ix, iy)
+        cr.set_source_rgb(r / 255, g / 255, b / 255)
+        cr.rectangle(px, py + box + 4, 16, 16)
+        cr.fill()
+        cr.set_source_rgb(0.91, 0.92, 0.93)
+        cr.set_font_size(12)
+        cr.move_to(px + 22, py + box + 16)
+        box_sel = self.session.sel_rect()
+        size = f"  {box_sel.width()}×{box_sel.height()}" if box_sel else ""
+        cr.show_text(f"#{r:02X}{g:02X}{b:02X}{size}")
+
+    def _begin_text(self, vx: float, vy: float, ix: float, iy: float) -> None:
+        self._commit_text()
+        self._text_img = (ix, iy)
+        entry = Gtk.Entry()
+        entry.set_width_chars(16)
+        entry.connect("activate", lambda *_: self._commit_text())
+        entry.connect("key-press-event", self._on_text_key)
+        self.layer.add_overlay(entry)
+        entry.set_halign(Gtk.Align.START)
+        entry.set_valign(Gtk.Align.START)
+        entry.set_margin_start(max(0, int(vx)))
+        entry.set_margin_top(max(0, int(vy)))
+        entry.show()
+        entry.grab_focus()
+        self._entry = entry
+
+    def _on_text_key(self, _w, ev) -> bool:
+        key = Gdk.keyval_name(ev.keyval) or ""
+        if key == "Escape":
+            self._discard_text()
+            return True
+        return False
+
+    def _discard_text(self) -> None:
+        if self._entry is not None:
+            try:
+                self.layer.remove(self._entry)
+            except Exception:
+                pass
+            self._entry = None
+        self._text_img = None
+        try:
+            self.da.grab_focus()
+        except Exception:
+            pass
+
+    def _commit_text(self, *_a) -> None:
+        entry = self._entry
+        pos = self._text_img
+        text = entry.get_text().strip() if entry is not None else ""
+        self._discard_text()
+        if pos and text:
+            self.strokes.append(
+                Stroke("text", self.color, self.pen_w, [pos], text=text, font=self.session.font_size)
+            )
+            self.redo.clear()
+            self.da.queue_draw()
 
     def _round_rect(self, cr, x, y, w, h, r) -> None:
         r = min(r, w / 2, h / 2)
@@ -449,11 +702,14 @@ class GtkOverlay:
         cr.arc(x + r, y + r, r, math.pi, math.pi * 1.5)
         cr.close_path()
 
+    def _kind_width(self, kind: str) -> int:
+        return 56 if kind == "long" else 34
+
     def _draw_bar(self, cr, win_w, win_h, sx, sy, x, y, w, h):
         kinds = BAR_KINDS
-        bw, bh, pad = 36, 40, 6
-        seps = {7, 9}
-        total = pad * 2 + len(kinds) * bw + len(seps) * 10
+        bh, pad = 40, 6
+        seps = {8, 10, 11}
+        total = pad * 2 + sum(self._kind_width(k) for k in kinds) + len(seps) * 10
         px = min(win_w - total - 10, max(10, (x + w) * sx - total))
         py = min(win_h - bh - 28, max(10, (y + h) * sy + 10))
         self._round_rect(cr, px, py, total, bh, 12)
@@ -472,11 +728,16 @@ class GtkOverlay:
                 cr.line_to(cursor + 5, py + bh - 10)
                 cr.stroke()
                 cursor += 10
-            slots.append((kind, cursor))
+            bw = self._kind_width(kind)
+            slots.append((kind, cursor, bw))
             active = kind == self.tool
             if active:
                 self._round_rect(cr, cursor + 3, py + 4, bw - 6, bh - 8, 8)
                 cr.set_source_rgba(0.18, 0.46, 1.0, 0.95)
+                cr.fill()
+            elif kind == "long":
+                self._round_rect(cr, cursor + 3, py + 6, bw - 6, bh - 12, 8)
+                cr.set_source_rgba(0.20, 0.44, 1.0, 0.95)
                 cr.fill()
             elif kind == "ok":
                 self._round_rect(cr, cursor + 3, py + 4, bw - 6, bh - 8, 8)
@@ -486,9 +747,17 @@ class GtkOverlay:
                 self._round_rect(cr, cursor + 3, py + 4, bw - 6, bh - 8, 8)
                 cr.set_source_rgba(0.96, 0.32, 0.36, 0.16)
                 cr.fill()
-            self._draw_icon(cr, kind, cursor + (bw - 20) / 2, py + (bh - 20) / 2, active)
+            if kind == "long":
+                cr.set_source_rgb(1, 1, 1)
+                cr.select_font_face("Sans")
+                cr.set_font_size(13)
+                ext = cr.text_extents("长图")
+                cr.move_to(cursor + (bw - ext.width) / 2, py + (bh + ext.height) / 2 - 1)
+                cr.show_text("长图")
+            else:
+                self._draw_icon(cr, kind, cursor + (bw - 20) / 2, py + (bh - 20) / 2, active)
             cursor += bw
-        self._bar_slots = (py, bh, slots, bw)
+        self._bar_slots = (px, py, total, bh, slots)
         cy = py + bh + 6
         cx = px
         color_slots = []
@@ -504,6 +773,35 @@ class GtkOverlay:
             color_slots.append((rgb, cx, cy))
             cx += 20
         self._color_slots = (cy, color_slots)
+
+    def _draw_long_bar(self, cr, win_w, win_h, sx, sy, x, y, w, h):
+        items = (("ok", "完成", 72), ("cancel", "取消", 64))
+        bh, pad, gap = 40, 8, 8
+        total = pad * 2 + sum(bw for _k, _t, bw in items) + gap * (len(items) - 1)
+        px = min(win_w - total - 10, max(10, (x + w) * sx - total))
+        py = min(win_h - bh - 16, max(10, (y + h) * sy + 12))
+        self._round_rect(cr, px, py, total, bh, 12)
+        cr.set_source_rgba(0.07, 0.09, 0.12, 0.94)
+        cr.fill()
+        cursor = px + pad
+        slots = []
+        for kind, label, bw in items:
+            slots.append((kind, cursor, bw))
+            if kind == "ok":
+                cr.set_source_rgba(0.13, 0.72, 0.47, 0.95)
+            else:
+                cr.set_source_rgba(0.96, 0.32, 0.36, 0.88)
+            self._round_rect(cr, cursor, py + 6, bw, bh - 12, 8)
+            cr.fill()
+            cr.set_source_rgb(1, 1, 1)
+            cr.select_font_face("Sans")
+            cr.set_font_size(13)
+            ext = cr.text_extents(label)
+            cr.move_to(cursor + (bw - ext.width) / 2, py + (bh + ext.height) / 2 - 1)
+            cr.show_text(label)
+            cursor += bw + gap
+        self._bar_slots = (px, py, total, bh, slots)
+        self._color_slots = None
 
     def _draw_icon(self, cr, kind: str, x: float, y: float, active: bool = False) -> None:
         cr.save()
@@ -566,6 +864,22 @@ class GtkOverlay:
             cr.set_line_width(1.5)
             cr.move_to(x + 6.5, y + 16.4)
             cr.line_to(x + 13.5, y + 16.4)
+            cr.stroke()
+        elif kind == "step":
+            cr.arc(x + 10, y + 10, 7.2, 0, math.tau)
+            cr.fill()
+            cr.set_source_rgb(0.07, 0.09, 0.12) if not active else cr.set_source_rgb(0.12, 0.32, 0.85)
+            cr.select_font_face("Sans")
+            cr.set_font_size(10)
+            cr.move_to(x + 7.2, y + 13.4)
+            cr.show_text("1")
+        elif kind == "long":
+            self._round_rect(cr, x + 4, y + 2, 12, 7, 1.4)
+            cr.stroke()
+            self._round_rect(cr, x + 4, y + 8, 12, 7, 1.4)
+            cr.stroke()
+            cr.move_to(x + 10, y + 16.6)
+            cr.line_to(x + 10, y + 12.2)
             cr.stroke()
         elif kind == "undo":
             cr.arc_negative(x + 10.2, y + 10.6, 6.2, math.radians(28), math.radians(-145))
@@ -664,8 +978,21 @@ class GtkOverlay:
             cr.fill()
         elif stroke.kind == "mosaic" and len(pts) >= 2:
             self._draw_mosaic(cr, pts)
+        elif stroke.kind == "step" and pts:
+            x, y = pts[0]
+            r = max(10, stroke.font * 0.7)
+            cr.arc(x, y, r, 0, math.tau)
+            cr.set_source_rgb(stroke.color[0] / 255, stroke.color[1] / 255, stroke.color[2] / 255)
+            cr.fill()
+            cr.set_source_rgb(1, 1, 1)
+            cr.select_font_face("Sans")
+            cr.set_font_size(max(10, stroke.font))
+            label = stroke.text or "1"
+            ext = cr.text_extents(label)
+            cr.move_to(x - ext.width / 2, y + ext.height / 2)
+            cr.show_text(label)
         elif stroke.kind == "text" and stroke.text:
-            cr.set_font_size(18)
+            cr.set_font_size(max(10, stroke.font))
             cr.move_to(*pts[0])
             cr.show_text(stroke.text)
 
@@ -679,9 +1006,9 @@ class GtkOverlay:
     def _hit_bar(self, x, y) -> str | None:
         slots = self._bar_slots
         if slots:
-            py, bh, items, bw = slots
-            if py <= y <= py + bh:
-                for kind, sx in items:
+            px, py, total, bh, items = slots
+            if py <= y <= py + bh and px <= x <= px + total:
+                for kind, sx, bw in items:
                     if sx <= x <= sx + bw:
                         return kind
         colors = self._color_slots
@@ -706,6 +1033,156 @@ class GtkOverlay:
         self.session.note_active(self)
         return False
 
+    def _on_scroll(self, widget, ev) -> bool:
+        if self.session.drag or not self.session.ready:
+            return False
+        if self.session.sel_rect() is None:
+            return False
+        vx, vy = self._event_xy(widget, ev)
+        if self._hit_bar(vx, vy) is not None:
+            return False
+        ix, iy = self._to_img(widget, ev)
+        if self._hit_handle(ix, iy) != "inside":
+            return False
+        if self.session.long_mode:
+            return True
+        self.session.request_longshot(_scroll_axis(ev))
+        return True
+
+    def enter_long_mode(self) -> None:
+        self.da.queue_draw()
+
+    def hide_for_grab(self) -> None:
+        try:
+            self.win.set_keep_above(False)
+            self.win.set_accept_focus(False)
+        except Exception:
+            pass
+        try:
+            self.win.unfullscreen()
+        except Exception:
+            pass
+        try:
+            empty = cairo.Region()
+            for widget in (self.win, self.layer, self.da):
+                try:
+                    widget.input_shape_combine_region(empty)
+                except Exception:
+                    pass
+            gdk = self.win.get_window()
+            if gdk is not None:
+                gdk.input_shape_combine_region(empty, 0, 0)
+        except Exception:
+            pass
+        try:
+            self.win.hide()
+        except Exception:
+            pass
+
+    def show_after_grab(self) -> None:
+        try:
+            self.win.show_all()
+            self.win.fullscreen_on_monitor(self.gdk_screen, self.mon_idx)
+            self.win.present()
+        except Exception:
+            pass
+        self.da.queue_draw()
+
+    def paste_from_desk(self, box: QRect, image: QImage) -> None:
+        inter = self.desk.intersected(box)
+        if inter.isEmpty() or image.isNull():
+            return
+        local = self._local_rect(inter)
+        if local is None:
+            return
+        sx = image.width() / max(1, box.width())
+        sy = image.height() / max(1, box.height())
+        src = QRect(
+            int(round((inter.x() - box.x()) * sx)),
+            int(round((inter.y() - box.y()) * sy)),
+            max(1, int(round(inter.width() * sx))),
+            max(1, int(round(inter.height() * sy))),
+        ).intersected(QRect(0, 0, image.width(), image.height()))
+        piece = qimage_to_pixbuf(image.copy(src))
+        x, y, w, h = [int(round(v)) for v in local]
+        x = max(0, min(x, self.img_w - 1))
+        y = max(0, min(y, self.img_h - 1))
+        w = max(1, min(w, self.img_w - x))
+        h = max(1, min(h, self.img_h - y))
+        if piece.get_width() != w or piece.get_height() != h:
+            piece = piece.scale_simple(w, h, GdkPixbuf.InterpType.BILINEAR)
+        try:
+            piece.composite(self.pixbuf, x, y, w, h, x, y, 1, 1, GdkPixbuf.InterpType.BILINEAR, 255)
+        except Exception:
+            pass
+
+    def grab_keys(self) -> None:
+        return
+
+    def ungrab_keys(self) -> None:
+        if self._seat is None:
+            return
+        try:
+            self._seat.ungrab()
+        except Exception:
+            pass
+        self._seat = None
+
+    def _on_layer_draw(self, _w, cr):
+        return False
+
+    def _on_configure(self, *_a):
+        if self.session.long_mode:
+            self._shape_key = None
+            self._apply_input_shape()
+        return False
+
+    def _on_allocate(self, *_a):
+        if self.session.long_mode:
+            self._shape_key = None
+            self._apply_input_shape()
+
+    def _maybe_apply_shape(self) -> None:
+        key = (self._bar_slots, self._local_rect(self.session.sel_rect()))
+        if key == self._shape_key:
+            return
+        self._shape_key = key
+        GLib.idle_add(self._apply_input_shape)
+
+    def _region_from_da(self, widget, region):
+        if widget is self.da:
+            return region
+        try:
+            ok, tx, ty = self.da.translate_coordinates(widget, 0, 0)
+            if ok and (int(tx) or int(ty)):
+                moved = cairo.Region(region)
+                moved.translate(int(tx), int(ty))
+                return moved
+        except Exception:
+            pass
+        return region
+
+    def _apply_input_shape(self) -> bool:
+        vis_w, vis_h = self._view_size()
+        incoming = cairo.Region(cairo.RectangleInt(0, 0, max(1, int(vis_w)), max(1, int(vis_h))))
+        for widget in (self.win, self.layer, self.da):
+            region = self._region_from_da(widget, incoming)
+            try:
+                widget.input_shape_combine_region(region)
+            except Exception:
+                pass
+            try:
+                gw = widget.get_window()
+            except Exception:
+                gw = None
+            if gw is None:
+                continue
+            try:
+                gw.input_shape_combine_region(region, 0, 0)
+            except Exception:
+                pass
+        return False
+
     def _on_press(self, widget, ev):
         if self._dup_event(ev):
             return True
@@ -713,6 +1190,8 @@ class GtkOverlay:
         if ev.button == 3:
             self.session.finish(None)
             return True
+        if ev.button == 1 and self._entry is not None:
+            self._commit_text()
         if ev.button != 1:
             return False
         vx, vy = self._event_xy(widget, ev)
@@ -721,6 +1200,8 @@ class GtkOverlay:
             return True
         if hit is not None:
             self._bar_action(hit)
+            return True
+        if self.session.long_mode:
             return True
         if not self.session.ready:
             return True
@@ -736,7 +1217,15 @@ class GtkOverlay:
             return True
         if handle == "inside" and self.tool in TOOLS:
             if self.tool == "text":
-                self._add_text(ix, iy)
+                self._begin_text(vx, vy, ix, iy)
+                return True
+            if self.tool == "step":
+                n = self.session.next_step()
+                self.strokes.append(
+                    Stroke("step", self.color, self.pen_w, [(ix, iy)], text=str(n), font=self.session.font_size)
+                )
+                self.redo.clear()
+                self.da.queue_draw()
                 return True
             self.draft = Stroke(self.tool, self.color, self.pen_w, [(ix, iy)])
             self.da.queue_draw()
@@ -772,11 +1261,14 @@ class GtkOverlay:
             self.da.queue_draw()
             return True
         handle = self._hit_handle(ix, iy)
+        vx, vy = self._event_xy(widget, ev)
+        self._hud = (vx, vy, ix, iy)
         if handle in HANDLE_CURSORS:
             self._set_cursor(HANDLE_CURSORS[handle])
         else:
             self._set_cursor("crosshair")
             self.session.hover_at(dx, dy)
+        self.da.queue_draw()
         return True
 
     def _on_release(self, widget, ev):
@@ -837,6 +1329,8 @@ class GtkOverlay:
             self._undo()
         elif kind == "redo":
             self._redo()
+        elif kind == "long":
+            self.session.request_longshot()
         elif kind == "save":
             self.session.save()
         elif kind == "pin":
@@ -856,20 +1350,6 @@ class GtkOverlay:
         if self.redo:
             self.strokes.append(self.redo.pop())
             self.da.queue_draw()
-
-    def _add_text(self, x, y) -> None:
-        dialog = Gtk.Dialog(title="文字", transient_for=self.win, flags=0)
-        dialog.add_button("确定", Gtk.ResponseType.OK)
-        entry = Gtk.Entry()
-        dialog.get_content_area().pack_start(entry, True, True, 8)
-        dialog.show_all()
-        if dialog.run() == Gtk.ResponseType.OK:
-            text = entry.get_text().strip()
-            if text:
-                self.strokes.append(Stroke("text", self.color, self.pen_w, [(x, y)], text=text))
-                self.redo.clear()
-        dialog.destroy()
-        self.da.queue_draw()
 
     def render_full(self) -> GdkPixbuf.Pixbuf:
         surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.img_w, self.img_h)
@@ -904,6 +1384,7 @@ class GtkOverlay:
         if self.closed:
             return
         self.closed = True
+        self._discard_text()
         if self._seat is not None:
             try:
                 self._seat.ungrab()
@@ -917,6 +1398,8 @@ class GtkOverlay:
             pass
 
     def _on_key(self, _w, ev):
+        if self._entry is not None:
+            return False
         key = Gdk.keyval_name(ev.keyval) or ""
         ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
         shift = bool(ev.state & Gdk.ModifierType.SHIFT_MASK)
@@ -939,10 +1422,20 @@ class GtkOverlay:
             self._undo()
             return True
         if key in {"bracketleft"}:
-            self.pen_w = max(2, self.pen_w - 1)
+            if self.tool in {"text", "step"}:
+                self.session.bump_font(-2)
+            else:
+                self.pen_w = max(2, self.pen_w - 1)
             return True
         if key in {"bracketright"}:
-            self.pen_w = min(16, self.pen_w + 1)
+            if self.tool in {"text", "step"}:
+                self.session.bump_font(2)
+            else:
+                self.pen_w = min(16, self.pen_w + 1)
+            return True
+        if key in {"l", "L"} and not ctrl:
+            if not self.session.long_mode:
+                self.session.request_longshot()
             return True
         if key in {str(n) for n in range(1, 10)}:
             self.session.grab_index(int(key) - 1)
@@ -973,6 +1466,15 @@ class OverlaySession(QObject):
         self.hover: TopWindow | None = None
         self.windows: list[TopWindow] = []
         self.overlays: list[GtkOverlay] = []
+        self.font_size = 18
+        self.step_n = 0
+        self.long_mode = False
+        self.long_axis = "v"
+        self.longshot_rect: QRect | None = None
+        self.longshot_frames: list[QImage] = []
+        self._long_follow = False
+        self._long_scroll_armed = False
+        self._panel = None
         for shot in shots:
             overlay = GtkOverlay(shot, self)
             self._used_monitors.add(overlay.mon_idx)
@@ -1013,6 +1515,118 @@ class OverlaySession(QObject):
         for overlay in self.overlays:
             overlay.tool = tool
 
+    def next_step(self) -> int:
+        self.step_n += 1
+        return self.step_n
+
+    def bump_font(self, delta: int) -> None:
+        self.font_size = max(12, min(56, self.font_size + delta))
+
+    def commit_text(self) -> None:
+        for overlay in self.overlays:
+            overlay._commit_text()
+
+    def request_longshot(self, axis: str | None = None) -> None:
+        if self._emitted or not self.ready or self.long_mode:
+            event("long.enter.skip", emitted=int(self._emitted), ready=int(self.ready), long=int(self.long_mode))
+            return
+        self.commit_text()
+        box = self.sel_rect()
+        if box is None or box.width() < 8 or box.height() < 8:
+            event("long.enter.skip", reason="no-box")
+            return
+        image = self.export_image()
+        if image is None or image.isNull():
+            event("long.enter.skip", reason="export-empty")
+            return
+        self.long_mode = True
+        self.long_axis = "h" if axis == "h" else "v"
+        self.drag = ""
+        self.longshot_rect = QRect(box)
+        self.longshot_frames = [image]
+        self._long_scroll_armed = False
+        event(
+            "long.enter",
+            axis=self.long_axis,
+            x=box.x(),
+            y=box.y(),
+            w=box.width(),
+            h=box.height(),
+            first_w=image.width(),
+            first_h=image.height(),
+            overlays=len(self.overlays),
+        )
+        for overlay in self.overlays:
+            overlay.destroy_quiet()
+        pump_gtk()
+        from .longshot import LongShotBar
+
+        self._panel = LongShotBar(
+            self.longshot_rect,
+            image,
+            on_copy=self._on_panel_copy,
+            on_cancel=self._on_panel_cancel,
+            axis=self.long_axis,
+        )
+        event("long.bar.shown")
+
+    def _long_frames(self) -> list[QImage]:
+        panel = getattr(self, "_panel", None)
+        if panel is not None and getattr(panel, "frames", None):
+            return list(panel.frames)
+        return list(self.longshot_frames)
+
+    def _stitch_long_frames(self, frames: list[QImage] | None = None) -> QImage | None:
+        frames = list(self.longshot_frames if frames is None else frames)
+        image = stitch_long(frames, self.long_axis)
+        if image is not None and not image.isNull():
+            return image
+        for item in reversed(frames):
+            if item is not None and not item.isNull():
+                return item
+        return None
+
+    def _on_panel_copy(self, image: QImage | None) -> None:
+        panel = getattr(self, "_panel", None)
+        n = len(panel.frames) if panel is not None else 0
+        if panel is not None:
+            self.longshot_frames = list(panel.frames)
+        event("long.copy", frames=n, has_image=int(image is not None and not image.isNull()))
+        if image is None or image.isNull():
+            image = self._stitch_long_frames()
+            event("long.copy.fallback", has_image=int(image is not None and not image.isNull()))
+        if image is None or image.isNull():
+            event("long.copy.empty")
+            self.finish(None)
+            return
+        self.finish(image)
+
+    def _on_panel_cancel(self) -> None:
+        event("long.cancel")
+        self.finish(None)
+
+    def _stop_long(self) -> None:
+        self._long_follow = False
+        self._long_scroll_armed = False
+        panel = getattr(self, "_panel", None)
+        self._panel = None
+        if panel is not None:
+            event("long.bar.destroy")
+            try:
+                panel.destroy_ui()
+            except Exception as exc:
+                exception("long.bar.destroy", exc)
+
+    def _ungrab_keys(self) -> None:
+        for overlay in self.overlays:
+            overlay.ungrab_keys()
+
+    def _restore_long_keys(self) -> None:
+        if self._emitted or not self.long_mode:
+            return
+        owner = self.toolbar_owner() or self.overlays[0]
+        owner.grab_keys()
+
     def desktop_bounds(self) -> QRect:
         box = QRect(self.overlays[0].desk)
         for overlay in self.overlays[1:]:
@@ -1020,6 +1634,8 @@ class OverlaySession(QObject):
         return box
 
     def sel_rect(self) -> QRect | None:
+        if self.long_mode and self.longshot_rect is not None:
+            return QRect(self.longshot_rect)
         if not self.sel:
             return None
         x1, y1, x2, y2 = self.sel
@@ -1158,16 +1774,7 @@ class OverlaySession(QObject):
             pieces.append((inter, pixbuf_to_qimage(pix)))
         if not pieces:
             return None
-        canvas = QImage(max(1, box.width()), max(1, box.height()), QImage.Format_ARGB32)
-        canvas.fill(0)
-        painter = QPainter(canvas)
-        for inter, image in pieces:
-            dest = QRect(inter.x() - box.x(), inter.y() - box.y(), inter.width(), inter.height())
-            if image.width() != dest.width() or image.height() != dest.height():
-                image = image.scaled(dest.width(), dest.height())
-            painter.drawImage(dest.topLeft(), image)
-        painter.end()
-        return canvas
+        return compose_pieces(pieces, box)
 
     def export_pixbuf(self) -> GdkPixbuf.Pixbuf | None:
         image = self.export_image()
@@ -1176,13 +1783,16 @@ class OverlaySession(QObject):
     def accept(self, pin: bool = False) -> None:
         if self._emitted or not self.ready:
             return
-        image = self.export_image()
+        frames = self._long_frames()
+        self._stop_long()
+        if self.long_mode:
+            image = self._stitch_long_frames(frames)
+        else:
+            self.commit_text()
+            image = self.export_image()
         if image is None or image.isNull():
             return
         pix = qimage_to_pixbuf(image)
-        clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        clip.set_image(pix)
-        clip.store()
         self.pin = pin
         if pin:
             self.pins.append(PinWindow(pix))
@@ -1191,13 +1801,31 @@ class OverlaySession(QObject):
     def save(self) -> None:
         if not self.ready:
             return
-        pix = self.export_pixbuf()
-        if pix is None:
+        if self.long_mode:
+            panel = getattr(self, "_panel", None)
+            if panel is not None:
+                panel._save()
             return
+        self._ungrab_keys()
+        self.commit_text()
+        pix = self.export_pixbuf()
+        image = pixbuf_to_qimage(pix) if pix is not None else None
+        if pix is None:
+            self._restore_long_keys()
+            return
+        self._save_pixbuf(pix, image)
+
+    def _save_image(self, image: QImage, owner_win=None) -> None:
+        pix = qimage_to_pixbuf(image)
+        self._save_pixbuf(pix, image, owner_win=owner_win)
+
+    def _save_pixbuf(self, pix: GdkPixbuf.Pixbuf, image: QImage | None, owner_win=None) -> None:
+        self._ungrab_keys()
         owner = self.toolbar_owner() or self.overlays[0]
+        parent = owner_win if owner_win is not None else owner.win
         dialog = Gtk.FileChooserNative.new(
             "保存截图",
-            owner.win,
+            parent,
             Gtk.FileChooserAction.SAVE,
             "保存",
             "取消",
@@ -1211,18 +1839,18 @@ class OverlaySession(QObject):
         dialog.add_filter(filt)
         if dialog.run() != Gtk.ResponseType.ACCEPT:
             dialog.destroy()
+            self._restore_long_keys()
             return
         path = dialog.get_filename() or ""
         dialog.destroy()
         if not path:
+            self._restore_long_keys()
             return
         if not path.lower().endswith(".png"):
             path += ".png"
         pix.savev(path, "png", [], [])
-        clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        clip.set_image(pix)
-        clip.store()
-        self.finish(pixbuf_to_qimage(pix))
+        saved = image if image is not None and not image.isNull() else pixbuf_to_qimage(pix)
+        self.finish(saved)
 
     def redraw(self) -> None:
         for overlay in self.overlays:
@@ -1230,11 +1858,23 @@ class OverlaySession(QObject):
 
     def finish(self, image: QImage | None) -> None:
         if self._emitted:
+            event("finish.skip", reason="already")
             return
         self._emitted = True
-        self.result = image
+        if image is not None and not image.isNull():
+            self.result = image.copy()
+            event("finish.copy", w=self.result.width(), h=self.result.height())
+        else:
+            self.result = None
+            event("finish.empty")
+        self._stop_long()
+        self._ungrab_keys()
         for overlay in self.overlays:
             overlay.destroy_quiet()
+        pump_gtk()
+        if self.result is not None and not self.result.isNull():
+            copy_image(self.result)
+        event("finish.emit", has_result=int(self.result is not None and not self.result.isNull()))
         self.finished.emit()
 
     def close_all(self) -> None:

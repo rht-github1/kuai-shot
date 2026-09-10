@@ -13,8 +13,9 @@ from .capture import CaptureError, capture_shots, start_grabber
 from .display import probe_monitors, split_by_screens
 from .hotkey import register_gnome_hotkey, write_application_desktop, write_autostart
 from .ipc import CommandServer, send_command
+from .log import event, exception
 from .overlay_gtk import OverlaySession, ensure_gtk, pump_gtk
-from .paths import install_root
+from .paths import install_root, log_path
 from .permission import grant_screenshot_permission
 
 
@@ -27,6 +28,8 @@ class ShotApp(QObject):
         self.session = None
         self.pins: list = []
         self._busy = False
+        self._clip_image = None
+        self._clip_mime = None
         self._portal_job: dict | None = None
         self.ipc_cmd.connect(self._on_ipc)
         self.server = CommandServer(self.ipc_cmd.emit)
@@ -37,6 +40,7 @@ class ShotApp(QObject):
         self._glib.timeout.connect(pump_gtk)
         self._glib.start(5)
         self.tray = self._make_tray()
+        event("app.start", log=str(log_path()))
         qt.screenAdded.connect(self._on_screens_changed)
         qt.screenRemoved.connect(self._on_screens_changed)
         qt.primaryScreenChanged.connect(self._on_screens_changed)
@@ -89,40 +93,39 @@ class ShotApp(QObject):
     def _arm_capture(self) -> None:
         if self.session is not None or self._busy:
             return
-        if self._portal_job is None:
-            try:
-                self._portal_job = start_grabber().submit()
-            except Exception:
-                self._portal_job = None
         self.start_capture()
 
     def start_capture(self) -> None:
-        if self.session is not None:
+        if self.session is not None or self._busy:
+            event("app.capture.skip", busy=int(self._busy), has_session=int(self.session is not None))
             return
-        if self._busy:
-            return
+        event("app.capture.begin")
         self._busy = True
         try:
+            grabber = start_grabber()
+            job = self._portal_job
+            self._portal_job = None
+            if job is None:
+                job = grabber.submit()
             monitors = probe_monitors()
             if not monitors:
                 raise CaptureError("没有可用的屏幕")
-            job = self._portal_job
-            self._portal_job = None
             shots = []
-            if job is not None:
-                try:
-                    full = start_grabber().wait_image(job, timeout=4.0)
-                    shots = split_by_screens(full, monitors)
-                except CaptureError:
-                    shots = []
+            try:
+                full = grabber.wait_image(job, timeout=10.0)
+                shots = split_by_screens(full, monitors)
+            except CaptureError:
+                shots = []
             if not shots:
-                shots = capture_shots(monitors, skip_portal=job is not None)
+                shots = capture_shots(monitors, skip_portal=False)
             if not shots:
                 raise CaptureError("没有可用的屏幕")
             self.session = OverlaySession(shots)
             self.session.finished.connect(self._on_overlay_finished)
+            event("app.capture.overlay", shots=len(shots))
         except Exception as exc:
             self._busy = False
+            exception("app.capture.fail", exc)
             self.tray.showMessage(APP_NAME, str(exc), QSystemTrayIcon.Warning, 4000)
 
     def _on_overlay_finished(self) -> None:
@@ -130,10 +133,32 @@ class ShotApp(QObject):
         if session is not None:
             self.pins.extend(getattr(session, "pins", []) or [])
             result = getattr(session, "result", None)
+            event(
+                "app.finished",
+                has_result=int(result is not None and not result.isNull()),
+                w=0 if result is None or result.isNull() else result.width(),
+                h=0 if result is None or result.isNull() else result.height(),
+            )
             if result is not None and not result.isNull():
-                QApplication.clipboard().setImage(result)
+                from .overlay_gtk import _CLIP_HOLD, copy_image
+
+                self._clip_image = result.copy()
+                copy_image(self._clip_image)
+                self._clip_mime = _CLIP_HOLD.get("mime")
+                held = self._clip_image
+                QTimer.singleShot(120, lambda: self._reoffer_clip(held))
         self.session = None
         self._busy = False
+        event("app.idle")
+
+    def _reoffer_clip(self, image) -> None:
+        if image is None or image.isNull():
+            return
+        from .overlay_gtk import _CLIP_HOLD, copy_image
+
+        copy_image(image)
+        self._clip_mime = _CLIP_HOLD.get("mime")
+        event("app.clip.reoffer", w=image.width(), h=image.height())
 
     def quit(self) -> None:
         self.server.stop()

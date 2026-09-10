@@ -27,6 +27,7 @@ DEPS=(
   xdg-desktop-portal
   xdg-desktop-portal-gnome
   xdg-user-dirs
+  wl-clipboard
   rsync
   python3-pip
 )

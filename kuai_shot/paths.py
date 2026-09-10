@@ -39,6 +39,10 @@ def cache_dir() -> Path:
     return path
 
 
+def log_path() -> Path:
+    return cache_dir() / "kuai-shot.log"
+
+
 def config_dir() -> Path:
     path = Path(os.environ.get("XDG_CONFIG_HOME", user_home() / ".config")) / "kuai-shot"
     path.mkdir(parents=True, exist_ok=True)

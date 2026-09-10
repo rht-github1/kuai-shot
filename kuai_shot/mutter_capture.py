@@ -42,84 +42,145 @@ def _capture_thread(include_cursor: bool, box: dict) -> None:
         box["error"] = str(exc)
 
 
-def _capture_frames_with_glib(include_cursor: bool) -> list[dict]:
-    from gi.repository import Gio, GLib
+class RegionCaster:
+    """Keep one Mutter ScreenCast session and pull frames without tearing it down."""
 
-    ctx = GLib.MainContext.new()
-    ctx.push_thread_default()
-    try:
-        conn = _session_connection()
-        connectors = _connectors(conn)
-        if not connectors:
-            raise MutterCaptureError("没有可录制的显示器")
+    def __init__(self) -> None:
+        self._ctx = None
+        self._conn = None
+        self._sess = None
+        self._streams: list[dict] = []
+        self._pipes: list[dict] = []
+        self._last: dict[str, QImage] = {}
+        self._primed = False
+        self._started = False
 
-        cast = Gio.DBusProxy.new_sync(
-            conn,
-            Gio.DBusProxyFlags.NONE,
-            None,
-            "org.gnome.Mutter.ScreenCast",
-            "/org/gnome/Mutter/ScreenCast",
-            "org.gnome.Mutter.ScreenCast",
-            None,
-        )
-        sess_path = cast.call_sync(
-            "CreateSession",
-            GLib.Variant("(a{sv})", ({"disable-animations": GLib.Variant("b", True)},)),
-            Gio.DBusCallFlags.NONE,
-            4000,
-            None,
-        ).unpack()[0]
-        sess = Gio.DBusProxy.new_sync(
-            conn,
-            Gio.DBusProxyFlags.NONE,
-            None,
-            "org.gnome.Mutter.ScreenCast",
-            sess_path,
-            "org.gnome.Mutter.ScreenCast.Session",
-            None,
-        )
-        cursor_mode = 1 if include_cursor else 0
-        props = {"cursor-mode": GLib.Variant("u", cursor_mode)}
-        streams: list[dict] = []
-        for name in connectors:
-            path = sess.call_sync(
-                "RecordMonitor",
-                GLib.Variant("(sa{sv})", (name, props)),
+    def start(self, names: list[str] | None = None, include_cursor: bool = False) -> None:
+        from gi.repository import Gio, GLib
+
+        if self._started:
+            return
+        self._ctx = GLib.MainContext.new()
+        self._ctx.push_thread_default()
+        try:
+            self._conn = _session_connection()
+            connectors = _pick_connectors(self._conn, names)
+            if not connectors:
+                raise MutterCaptureError("没有可录制的显示器")
+
+            cast = Gio.DBusProxy.new_sync(
+                self._conn,
+                Gio.DBusProxyFlags.NONE,
+                None,
+                "org.gnome.Mutter.ScreenCast",
+                "/org/gnome/Mutter/ScreenCast",
+                "org.gnome.Mutter.ScreenCast",
+                None,
+            )
+            sess_path = cast.call_sync(
+                "CreateSession",
+                GLib.Variant("(a{sv})", ({"disable-animations": GLib.Variant("b", True)},)),
                 Gio.DBusCallFlags.NONE,
                 4000,
                 None,
             ).unpack()[0]
-            streams.append({"path": path, "name": name, "node": None, "x": 0, "y": 0})
+            self._sess = Gio.DBusProxy.new_sync(
+                self._conn,
+                Gio.DBusProxyFlags.NONE,
+                None,
+                "org.gnome.Mutter.ScreenCast",
+                sess_path,
+                "org.gnome.Mutter.ScreenCast.Session",
+                None,
+            )
+            cursor_mode = 1 if include_cursor else 0
+            props = {"cursor-mode": GLib.Variant("u", cursor_mode)}
+            streams: list[dict] = []
+            for name in connectors:
+                path = self._sess.call_sync(
+                    "RecordMonitor",
+                    GLib.Variant("(sa{sv})", (name, props)),
+                    Gio.DBusCallFlags.NONE,
+                    4000,
+                    None,
+                ).unpack()[0]
+                streams.append({"path": path, "name": name, "node": None, "x": 0, "y": 0})
 
-        pending = {item["path"]: item for item in streams}
-        loop = GLib.MainLoop(ctx)
+            pending = {item["path"]: item for item in streams}
+            loop = GLib.MainLoop(self._ctx)
 
-        def on_signal(_c, _s, path, _iface, signal, parameters):
-            if signal != "PipeWireStreamAdded" or path not in pending:
-                return
-            pending[path]["node"] = int(parameters.unpack()[0])
-            _fill_geometry(conn, pending[path])
-            if all(item["node"] is not None for item in streams):
-                loop.quit()
+            def on_signal(_c, _s, path, _iface, signal, parameters):
+                if signal != "PipeWireStreamAdded" or path not in pending:
+                    return
+                pending[path]["node"] = int(parameters.unpack()[0])
+                _fill_geometry(self._conn, pending[path])
+                if all(item["node"] is not None for item in streams):
+                    loop.quit()
 
-        conn.signal_subscribe(
-            None,
-            "org.gnome.Mutter.ScreenCast.Stream",
-            "PipeWireStreamAdded",
-            None,
-            None,
-            Gio.DBusSignalFlags.NONE,
-            on_signal,
-        )
-        GLib.timeout_add(2000, loop.quit)
-        sess.call_sync("Start", None, Gio.DBusCallFlags.NONE, 4000, None)
-        loop.run()
-        missing = [item["name"] for item in streams if item["node"] is None]
-        if missing:
-            raise MutterCaptureError("PipeWire 节点未就绪: " + ", ".join(missing))
+            self._conn.signal_subscribe(
+                None,
+                "org.gnome.Mutter.ScreenCast.Stream",
+                "PipeWireStreamAdded",
+                None,
+                None,
+                Gio.DBusSignalFlags.NONE,
+                on_signal,
+            )
+            GLib.timeout_add(2000, loop.quit)
+            self._sess.call_sync("Start", None, Gio.DBusCallFlags.NONE, 4000, None)
+            loop.run()
+            missing = [item["name"] for item in streams if item["node"] is None]
+            if missing:
+                raise MutterCaptureError("PipeWire 节点未就绪: " + ", ".join(missing))
+            self._streams = streams
+            self._open_pipes()
+            self._started = True
+        except Exception:
+            self.stop()
+            raise
+
+    def _open_pipes(self) -> None:
+        self._close_pipes()
+        for item in self._streams:
+            pipe, sink = _gst_open(item["node"])
+            self._pipes.append({"item": item, "pipe": pipe, "sink": sink})
+
+    def _close_pipes(self) -> None:
+        if not self._pipes:
+            self._primed = False
+            return
+        import gi
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+
+        if not Gst.is_initialized():
+            Gst.init(None)
+        for entry in self._pipes:
+            try:
+                entry["pipe"].set_state(Gst.State.NULL)
+            except Exception:
+                pass
+        self._pipes = []
+        self._primed = False
+
+    def grab_frames(self) -> list[dict]:
+        if not self._started:
+            raise MutterCaptureError("ScreenCast 未启动")
+        if not self._pipes:
+            self._open_pipes()
+        timeout = 800 if not self._primed else 120
         frames = []
-        for item in streams:
-            image = _gst_grab(item["node"])
+        for entry in self._pipes:
+            item = entry["item"]
+            image = None
+            try:
+                image = _gst_pull(entry["sink"], timeout)
+            except Exception:
+                image = self._last.get(item["name"])
+            if image is None:
+                raise MutterCaptureError("PipeWire 没有输出帧")
+            self._last[item["name"]] = image
             frames.append(
                 {
                     "name": item["name"],
@@ -128,16 +189,52 @@ def _capture_frames_with_glib(include_cursor: bool) -> list[dict]:
                     "y": item["y"],
                 }
             )
-        try:
-            sess.call_sync("Stop", None, Gio.DBusCallFlags.NONE, 4000, None)
-        except Exception:
-            pass
+        self._primed = True
         return frames
+
+    def stop(self) -> None:
+        self._close_pipes()
+        if self._sess is not None:
+            try:
+                self._sess.call_sync("Stop", None, Gio.DBusCallFlags.NONE, 4000, None)
+            except Exception:
+                pass
+        self._sess = None
+        self._streams = []
+        self._started = False
+        if self._ctx is not None:
+            try:
+                self._ctx.pop_thread_default()
+            except Exception:
+                pass
+            self._ctx = None
+        self._conn = None
+
+
+def _capture_frames_with_glib(include_cursor: bool) -> list[dict]:
+    caster = RegionCaster()
+    try:
+        caster.start(include_cursor=include_cursor)
+        return caster.grab_frames()
     finally:
-        try:
-            ctx.pop_thread_default()
-        except Exception:
-            pass
+        caster.stop()
+
+
+def _pick_connectors(conn, names: list[str] | None) -> list[str]:
+    available = _connectors(conn)
+    if not names:
+        return available
+    picked: list[str] = []
+    for name in names:
+        if not name:
+            continue
+        if name in available and name not in picked:
+            picked.append(name)
+            continue
+        match = next((item for item in available if name in item or item in name), None)
+        if match and match not in picked:
+            picked.append(match)
+    return picked or available
 
 
 def _session_connection():
@@ -211,7 +308,7 @@ def _fill_geometry(conn, stream: dict) -> None:
         pass
 
 
-def _gst_grab(node_id: int) -> QImage:
+def _gst_open(node_id: int):
     import gi
 
     gi.require_version("Gst", "1.0")
@@ -221,38 +318,46 @@ def _gst_grab(node_id: int) -> QImage:
         Gst.init(None)
 
     pipeline = Gst.parse_launch(
-        f"pipewiresrc path={int(node_id)} do-timestamp=true num-buffers=1 ! "
-        "videoconvert ! video/x-raw,format=RGBA ! appsink name=sink max-buffers=1 sync=false"
+        f"pipewiresrc path={int(node_id)} do-timestamp=true ! "
+        "videoconvert ! video/x-raw,format=RGBA ! "
+        "appsink name=sink max-buffers=2 drop=true sync=false"
     )
     sink = pipeline.get_by_name("sink")
     if sink is None:
+        pipeline.set_state(Gst.State.NULL)
         raise MutterCaptureError("GStreamer appsink 不可用")
     pipeline.set_state(Gst.State.PLAYING)
+    return pipeline, sink
+
+
+def _gst_pull(sink, timeout_ms: int) -> QImage:
+    import gi
+
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    sample = sink.emit("try-pull-sample", max(1, int(timeout_ms)) * Gst.MSECOND)
+    if sample is None:
+        raise MutterCaptureError("PipeWire 没有输出帧")
+    buf = sample.get_buffer()
+    caps = sample.get_caps()
+    info = caps.get_structure(0)
+    width = int(info.get_value("width"))
+    height = int(info.get_value("height"))
+    ok, mapped = buf.map(Gst.MapFlags.READ)
+    if not ok:
+        raise MutterCaptureError("无法读取 PipeWire 帧")
     try:
-        sample = sink.emit("try-pull-sample", Gst.SECOND)
-        if sample is None:
-            raise MutterCaptureError("PipeWire 没有输出帧")
-        buf = sample.get_buffer()
-        caps = sample.get_caps()
-        info = caps.get_structure(0)
-        width = int(info.get_value("width"))
-        height = int(info.get_value("height"))
-        ok, mapped = buf.map(Gst.MapFlags.READ)
-        if not ok:
-            raise MutterCaptureError("无法读取 PipeWire 帧")
-        try:
-            raw = bytes(mapped.data)
-        finally:
-            buf.unmap(mapped)
-        stride = width * 4
-        if height > 0 and len(raw) >= width * height * 4:
-            stride = max(stride, len(raw) // height)
-        image = QImage(raw, width, height, stride, QImage.Format_RGBA8888).copy()
-        if image.isNull():
-            raise MutterCaptureError("PipeWire 帧无效")
-        return image.convertToFormat(QImage.Format_RGB32)
+        raw = bytes(mapped.data)
     finally:
-        pipeline.set_state(Gst.State.NULL)
+        buf.unmap(mapped)
+    stride = width * 4
+    if height > 0 and len(raw) >= width * height * 4:
+        stride = max(stride, len(raw) // height)
+    image = QImage(raw, width, height, stride, QImage.Format_RGBA8888).copy()
+    if image.isNull():
+        raise MutterCaptureError("PipeWire 帧无效")
+    return image.convertToFormat(QImage.Format_RGB32)
 
 
 def _screen_by_name() -> dict[str, object]:

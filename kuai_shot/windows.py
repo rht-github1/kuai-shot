@@ -204,3 +204,43 @@ def window_at(
     if not hits:
         return None
     return min(hits, key=lambda w: w.rect.width() * w.rect.height())
+
+
+def scroll_at(desk_x: float, desk_y: float, dx: float, dy: float) -> bool:
+    """Inject a wheel/page scroll at a desktop point. Call after the overlay is hidden."""
+    if not _init_atspi():
+        return False
+    try:
+        from gi.repository import Atspi
+    except Exception:
+        return False
+    x, y = int(round(desk_x)), int(round(desk_y))
+    sent = False
+    try:
+        Atspi.generate_mouse_event(x, y, "abs")
+        sent = True
+    except Exception:
+        pass
+    clicks_y = max(1, min(8, int(round(abs(dy))) or (1 if dy else 0)))
+    clicks_x = max(0, min(8, int(round(abs(dx)))))
+    btn_y = "b5" if dy > 0 else "b4"
+    btn_x = "b7" if dx > 0 else "b6"
+    for name, n in ((btn_y, clicks_y if dy else 0), (btn_x, clicks_x)):
+        for _ in range(n):
+            try:
+                Atspi.generate_mouse_event(x, y, name)
+                sent = True
+            except Exception:
+                pass
+    if abs(dy) >= 0.2:
+        key = "Page_Down" if dy > 0 else "Page_Up"
+        try:
+            Atspi.generate_keyboard_event(0, key, Atspi.KeySynthType.STRING)
+            sent = True
+        except Exception:
+            try:
+                Atspi.generate_keyboard_event(0xFF56 if dy > 0 else 0xFF55, "", Atspi.KeySynthType.SYM)
+                sent = True
+            except Exception:
+                pass
+    return sent

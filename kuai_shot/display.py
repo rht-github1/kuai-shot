@@ -241,6 +241,16 @@ def probe_monitors() -> list[Monitor]:
     return monitors
 
 
+def monitor_names_for_rect(rect: QRect, monitors: list[Monitor] | None = None) -> list[str]:
+    names: list[str] = []
+    for mon in monitors or probe_monitors():
+        if not mon.name or not mon.logical.intersects(rect):
+            continue
+        if mon.name not in names:
+            names.append(mon.name)
+    return names
+
+
 def _bounds(rects: list[QRect]) -> QRect:
     box = QRect(rects[0])
     for rect in rects[1:]:
