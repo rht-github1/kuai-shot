@@ -261,104 +261,144 @@ class GtkOverlay:
         cr.set_source_rgb(0.91, 0.92, 0.93)
         cr.set_font_size(13)
         cr.move_to(24, 35)
-        cr.show_text(f"本屏 {self.img_w}×{self.img_h}  ·  拖拽选区  Enter复制  保存才写文件  Esc取消")
+        cr.show_text(f"本屏 {self.img_w}×{self.img_h}  ·  在此屏拖拽  Enter复制  保存才写文件  Esc取消")
+
+    def _round_rect(self, cr, x, y, w, h, r) -> None:
+        r = min(r, w / 2, h / 2)
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, math.pi * 1.5)
+        cr.close_path()
 
     def _draw_bar(self, cr, win_w, win_h, sx, sy, x, y, w, h):
         kinds = ["rect", "ellipse", "arrow", "pen", "mosaic", "text", "undo", "save", "ok", "cancel"]
-        bw, bh = 36, 32
-        total = len(kinds) * bw + 8
-        px = min(win_w - total - 8, max(8, (x + w) * sx - total))
-        py = min(win_h - bh - 8, max(8, (y + h) * sy + 8))
-        self._bar = (px, py, bw, kinds)
-        cr.set_source_rgba(0.17, 0.18, 0.21, 0.95)
-        cr.rectangle(px, py, total, bh)
-        cr.fill()
+        bw, bh, pad = 40, 40, 6
+        seps = {6, 8}
+        total = pad * 2 + len(kinds) * bw + len(seps) * 10
+        px = min(win_w - total - 10, max(10, (x + w) * sx - total))
+        py = min(win_h - bh - 10, max(10, (y + h) * sy + 10))
+        self._bar = (px, py, bw, kinds, pad, seps)
+        self._round_rect(cr, px, py, total, bh, 12)
+        cr.set_source_rgba(0.07, 0.09, 0.12, 0.94)
+        cr.fill_preserve()
+        cr.set_source_rgba(0.28, 0.34, 0.42, 0.55)
+        cr.set_line_width(1)
+        cr.stroke()
+        cursor = px + pad
+        slots = []
         for i, kind in enumerate(kinds):
-            cx = px + 8 + i * bw
-            cy = py + 6
-            if kind == self.tool:
-                cr.set_source_rgba(0.20, 0.44, 1, 0.35)
-                cr.rectangle(px + i * bw + 2, py + 2, bw - 2, bh - 4)
+            if i in seps:
+                cr.set_source_rgba(1, 1, 1, 0.12)
+                cr.set_line_width(1)
+                cr.move_to(cursor + 5, py + 10)
+                cr.line_to(cursor + 5, py + bh - 10)
+                cr.stroke()
+                cursor += 10
+            slots.append((kind, cursor))
+            active = kind == self.tool
+            if active:
+                self._round_rect(cr, cursor + 3, py + 4, bw - 6, bh - 8, 8)
+                cr.set_source_rgba(0.18, 0.46, 1.0, 0.95)
                 cr.fill()
-            self._draw_icon(cr, kind, cx, cy)
+            elif kind == "ok":
+                self._round_rect(cr, cursor + 3, py + 4, bw - 6, bh - 8, 8)
+                cr.set_source_rgba(0.13, 0.72, 0.47, 0.18)
+                cr.fill()
+            elif kind == "cancel":
+                self._round_rect(cr, cursor + 3, py + 4, bw - 6, bh - 8, 8)
+                cr.set_source_rgba(0.96, 0.32, 0.36, 0.16)
+                cr.fill()
+            self._draw_icon(cr, kind, cursor + (bw - 20) / 2, py + (bh - 20) / 2, active)
+            cursor += bw
+        self._bar_slots = (py, bh, slots, bw)
 
-    def _draw_icon(self, cr, kind: str, x: float, y: float) -> None:
+    def _draw_icon(self, cr, kind: str, x: float, y: float, active: bool = False) -> None:
         cr.save()
-        cr.set_line_width(1.8)
+        cr.set_line_width(1.7)
         cr.set_line_cap(1)
         cr.set_line_join(1)
         if kind == "ok":
-            cr.set_source_rgb(0.40, 0.86, 0.45)
+            cr.set_source_rgb(0.35, 0.95, 0.62) if not active else cr.set_source_rgb(1, 1, 1)
         elif kind == "cancel":
-            cr.set_source_rgb(1.00, 0.45, 0.40)
+            cr.set_source_rgb(1.0, 0.45, 0.48) if not active else cr.set_source_rgb(1, 1, 1)
         else:
-            cr.set_source_rgb(0.91, 0.92, 0.93)
+            cr.set_source_rgb(1, 1, 1) if active else cr.set_source_rgb(0.86, 0.90, 0.94)
         if kind == "rect":
-            cr.rectangle(x + 3, y + 4, 16, 12)
+            self._round_rect(cr, x + 2, y + 3.5, 16, 13, 2.5)
             cr.stroke()
         elif kind == "ellipse":
-            cr.arc(x + 11, y + 10, 7, 0, 6.283)
+            cr.arc(x + 10, y + 10, 7.2, 0, math.tau)
             cr.stroke()
         elif kind == "arrow":
             cr.move_to(x + 4, y + 16)
-            cr.line_to(x + 16, y + 4)
+            cr.line_to(x + 14.5, y + 5.5)
             cr.stroke()
-            cr.move_to(x + 8, y + 4)
-            cr.line_to(x + 16, y + 4)
-            cr.line_to(x + 16, y + 12)
-            cr.stroke()
+            cr.move_to(x + 8.2, y + 4.6)
+            cr.line_to(x + 16.2, y + 4.2)
+            cr.line_to(x + 15.6, y + 12.2)
+            cr.close_path()
+            cr.fill()
         elif kind == "pen":
-            cr.move_to(x + 4, y + 16)
-            cr.line_to(x + 7, y + 7)
-            cr.line_to(x + 15, y + 3)
-            cr.line_to(x + 17, y + 5)
-            cr.line_to(x + 9, y + 13)
+            cr.move_to(x + 13.8, y + 2.6)
+            cr.line_to(x + 17.2, y + 6.0)
+            cr.line_to(x + 7.4, y + 15.8)
+            cr.line_to(x + 3.2, y + 17.0)
+            cr.line_to(x + 4.4, y + 12.8)
             cr.close_path()
             cr.stroke()
-            cr.move_to(x + 4, y + 16)
-            cr.line_to(x + 8, y + 16)
+            cr.move_to(x + 6.2, y + 14.2)
+            cr.line_to(x + 14.6, y + 5.8)
             cr.stroke()
         elif kind == "mosaic":
-            for r in range(3):
-                for c in range(3):
-                    cr.rectangle(x + 3 + c * 6, y + 3 + r * 6, 4, 4)
-            cr.stroke()
+            cells = ((0, 0, 0.95), (9, 0, 0.45), (0, 9, 0.45), (9, 9, 0.95))
+            for cx, cy, a in cells:
+                cr.set_source_rgba(0.86, 0.90, 0.94, a) if not active else cr.set_source_rgba(1, 1, 1, a)
+                self._round_rect(cr, x + 2 + cx, y + 2 + cy, 7, 7, 1.6)
+                cr.fill()
         elif kind == "text":
-            cr.select_font_face("Sans")
-            cr.set_font_size(16)
-            cr.move_to(x + 6, y + 16)
-            cr.show_text("T")
-        elif kind == "undo":
-            cx, cy, radius = x + 12.0, y + 11.0, 6.4
-            cr.arc_negative(cx, cy, radius, math.radians(50), math.radians(-150))
+            cr.set_line_width(1.9)
+            cr.move_to(x + 4, y + 4.2)
+            cr.line_to(x + 16, y + 4.2)
+            cr.move_to(x + 10, y + 4.2)
+            cr.line_to(x + 10, y + 16.4)
             cr.stroke()
-            tip_x = cx + radius * math.cos(math.radians(-150))
-            tip_y = cy + radius * math.sin(math.radians(-150))
-            cr.move_to(tip_x - 6.2, tip_y)
-            cr.line_to(tip_x + 1.4, tip_y - 5.2)
-            cr.line_to(tip_x + 1.4, tip_y + 5.2)
+            cr.set_line_width(1.5)
+            cr.move_to(x + 6.5, y + 16.4)
+            cr.line_to(x + 13.5, y + 16.4)
+            cr.stroke()
+        elif kind == "undo":
+            cr.arc_negative(x + 10.2, y + 10.6, 6.2, math.radians(28), math.radians(-145))
+            cr.stroke()
+            cr.move_to(x + 2.2, y + 6.4)
+            cr.line_to(x + 2.0, y + 12.6)
+            cr.line_to(x + 7.8, y + 11.4)
             cr.close_path()
             cr.fill()
         elif kind == "save":
-            cr.rectangle(x + 4, y + 11, 14, 7)
+            cr.move_to(x + 10, y + 2.8)
+            cr.line_to(x + 10, y + 12.2)
             cr.stroke()
-            cr.move_to(x + 11, y + 3)
-            cr.line_to(x + 11, y + 13)
+            cr.move_to(x + 5.6, y + 8.4)
+            cr.line_to(x + 10, y + 13.2)
+            cr.line_to(x + 14.4, y + 8.4)
             cr.stroke()
-            cr.move_to(x + 6, y + 9)
-            cr.line_to(x + 11, y + 15)
-            cr.line_to(x + 16, y + 9)
+            cr.move_to(x + 3.4, y + 15.6)
+            cr.line_to(x + 16.6, y + 15.6)
             cr.stroke()
         elif kind == "ok":
-            cr.move_to(x + 3, y + 11)
-            cr.line_to(x + 8, y + 16)
-            cr.line_to(x + 18, y + 4)
+            cr.set_line_width(2.1)
+            cr.move_to(x + 3.4, y + 10.4)
+            cr.line_to(x + 8.2, y + 15.2)
+            cr.line_to(x + 16.8, y + 5.0)
             cr.stroke()
         elif kind == "cancel":
-            cr.move_to(x + 5, y + 4)
-            cr.line_to(x + 17, y + 16)
-            cr.move_to(x + 17, y + 4)
-            cr.line_to(x + 5, y + 16)
+            cr.set_line_width(2.0)
+            cr.move_to(x + 4.4, y + 4.4)
+            cr.line_to(x + 15.6, y + 15.6)
+            cr.move_to(x + 15.6, y + 4.4)
+            cr.line_to(x + 4.4, y + 15.6)
             cr.stroke()
         cr.restore()
 
@@ -420,15 +460,15 @@ class GtkOverlay:
         return max(0, min(self.img_w, ix)), max(0, min(self.img_h, iy))
 
     def _hit_bar(self, x, y) -> int | None:
-        bar = getattr(self, "_bar", None)
-        if not bar:
+        slots = getattr(self, "_bar_slots", None)
+        if not slots:
             return None
-        px, py, bw, kinds = bar
-        if y < py or y > py + 32:
+        py, bh, items, bw = slots
+        if y < py or y > py + bh:
             return None
-        i = int((x - px) / bw)
-        if 0 <= i < len(kinds):
-            return i
+        for i, (_kind, sx) in enumerate(items):
+            if sx <= x <= sx + bw:
+                return i
         return None
 
     def _dup_event(self, ev) -> bool:

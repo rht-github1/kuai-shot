@@ -3,13 +3,13 @@ from __future__ import annotations
 import os
 import queue
 import threading
-import time
 import uuid
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from PyQt5.QtGui import QColor, QGuiApplication, QImage, QImageReader, QPainter, QPixmap
 
+from .display import Monitor, ScreenShot, probe_monitors, split_by_screens
 from .paths import cache_dir
 
 
@@ -121,11 +121,66 @@ def _on_wayland() -> bool:
     return (os.environ.get("XDG_SESSION_TYPE") or "").lower() == "wayland"
 
 
-def capture_fullscreen(include_cursor: bool = False) -> QImage:
+def _match_frame(name: str, monitors: list[Monitor]) -> Monitor | None:
+    for mon in monitors:
+        if mon.name == name:
+            return mon
+    for mon in monitors:
+        if name and (name in mon.name or mon.name in name):
+            return mon
+    return None
+
+
+def _shots_from_frames(frames: list[dict], monitors: list[Monitor]) -> list[ScreenShot]:
+    shots: list[ScreenShot] = []
+    used: set[str] = set()
+    for item in frames:
+        image = item.get("image")
+        if image is None or image.isNull():
+            continue
+        mon = _match_frame(str(item.get("name") or ""), monitors)
+        if mon is None or mon.name in used:
+            continue
+        used.add(mon.name)
+        shots.append(ScreenShot(mon.screen, image, mon.logical))
+    return shots
+
+
+def capture_shots(
+    monitors: list[Monitor] | None = None,
+    include_cursor: bool = False,
+    skip_portal: bool = False,
+) -> list[ScreenShot]:
+    monitors = monitors or probe_monitors()
+    if not monitors:
+        raise CaptureError("没有可用的屏幕")
+    if not include_cursor and not skip_portal:
+        try:
+            full = _capture_portal()
+            if full is not None and not full.isNull() and not _mostly_blank(full):
+                shots = split_by_screens(full, monitors)
+                if shots:
+                    return shots
+        except Exception:
+            pass
+    try:
+        from .mutter_capture import capture_monitor_frames
+
+        shots = _shots_from_frames(capture_monitor_frames(include_cursor=include_cursor), monitors)
+        if shots:
+            return shots
+    except Exception:
+        pass
+    full = capture_fullscreen(include_cursor=include_cursor, skip_portal=skip_portal or not include_cursor)
+    return split_by_screens(full, monitors)
+
+
+def capture_fullscreen(include_cursor: bool = False, skip_portal: bool = False) -> QImage:
     errors: list[str] = []
-    fns = [_capture_mutter]
-    if not include_cursor:
+    fns = []
+    if not include_cursor and not skip_portal:
         fns.append(_capture_portal)
+    fns.append(_capture_mutter)
     fns.append(_capture_gnome_shell)
     if not _on_wayland():
         fns.append(_capture_qt)
@@ -150,17 +205,14 @@ def _mostly_blank(image: QImage) -> bool:
     step_x = max(1, w // 24)
     step_y = max(1, h // 16)
     total = 0
-    bright = 0
     dark = 0
     for y in range(0, h, step_y):
         for x in range(0, w, step_x):
             c = image.pixelColor(x, y)
             total += 1
-            if c.red() > 245 and c.green() > 245 and c.blue() > 245:
-                bright += 1
             if c.red() < 10 and c.green() < 10 and c.blue() < 10:
                 dark += 1
-    return total > 0 and (bright / total > 0.96 or dark / total > 0.96)
+    return total > 0 and dark / total > 0.98
 
 
 def _capture_mutter(include_cursor: bool = False) -> QImage | None:
@@ -182,15 +234,8 @@ def _capture_portal() -> QImage | None:
 
 def _load_captured_file(path: str) -> QImage | None:
     image = load_image_raw(path)
-    if not path:
-        return image
-    try:
-        resolved = Path(path).resolve()
-        cache = cache_dir().resolve()
-        if str(resolved).startswith(str(cache)) or str(resolved).startswith("/tmp"):
-            _safe_unlink(path)
-    except Exception:
-        pass
+    if path:
+        _safe_unlink(path)
     return image
 
 
@@ -252,6 +297,3 @@ def _safe_unlink(path: str) -> None:
         pass
 
 
-def wait_for_compositor(seconds: float = 0.0) -> None:
-    if seconds > 0:
-        time.sleep(seconds)

@@ -11,7 +11,12 @@ class MutterCaptureError(RuntimeError):
 
 
 def capture_monitors(include_cursor: bool = False) -> QImage:
-    box: dict = {"image": None, "error": ""}
+    frames = capture_monitor_frames(include_cursor=include_cursor)
+    return _stitch([(item["image"], item) for item in frames])
+
+
+def capture_monitor_frames(include_cursor: bool = False) -> list[dict]:
+    box: dict = {"frames": None, "error": ""}
     thread = threading.Thread(
         target=_capture_thread,
         args=(include_cursor, box),
@@ -19,25 +24,25 @@ def capture_monitors(include_cursor: bool = False) -> QImage:
         daemon=True,
     )
     thread.start()
-    thread.join(10)
+    thread.join(12)
     if thread.is_alive():
         raise MutterCaptureError("Mutter 截图超时")
     if box["error"]:
         raise MutterCaptureError(box["error"])
-    image = box["image"]
-    if image is None or image.isNull():
+    frames = box["frames"] or []
+    if not frames:
         raise MutterCaptureError("Mutter 未返回图像")
-    return image
+    return frames
 
 
 def _capture_thread(include_cursor: bool, box: dict) -> None:
     try:
-        box["image"] = _capture_with_glib(include_cursor)
+        box["frames"] = _capture_frames_with_glib(include_cursor)
     except Exception as exc:
         box["error"] = str(exc)
 
 
-def _capture_with_glib(include_cursor: bool) -> QImage:
+def _capture_frames_with_glib(include_cursor: bool) -> list[dict]:
     from gi.repository import Gio, GLib
 
     ctx = GLib.MainContext.new()
@@ -106,18 +111,28 @@ def _capture_with_glib(include_cursor: bool) -> QImage:
             Gio.DBusSignalFlags.NONE,
             on_signal,
         )
-        GLib.timeout_add(5000, loop.quit)
+        GLib.timeout_add(2000, loop.quit)
         sess.call_sync("Start", None, Gio.DBusCallFlags.NONE, 4000, None)
         loop.run()
         missing = [item["name"] for item in streams if item["node"] is None]
         if missing:
             raise MutterCaptureError("PipeWire 节点未就绪: " + ", ".join(missing))
-        frames = [(_gst_grab(item["node"]), item) for item in streams]
+        frames = []
+        for item in streams:
+            image = _gst_grab(item["node"])
+            frames.append(
+                {
+                    "name": item["name"],
+                    "image": image,
+                    "x": item["x"],
+                    "y": item["y"],
+                }
+            )
         try:
             sess.call_sync("Stop", None, Gio.DBusCallFlags.NONE, 4000, None)
         except Exception:
             pass
-        return _stitch(frames)
+        return frames
     finally:
         try:
             ctx.pop_thread_default()
@@ -214,7 +229,7 @@ def _gst_grab(node_id: int) -> QImage:
         raise MutterCaptureError("GStreamer appsink 不可用")
     pipeline.set_state(Gst.State.PLAYING)
     try:
-        sample = sink.emit("try-pull-sample", 5 * Gst.SECOND)
+        sample = sink.emit("try-pull-sample", Gst.SECOND)
         if sample is None:
             raise MutterCaptureError("PipeWire 没有输出帧")
         buf = sample.get_buffer()
@@ -240,20 +255,36 @@ def _gst_grab(node_id: int) -> QImage:
         pipeline.set_state(Gst.State.NULL)
 
 
+def _screen_by_name() -> dict[str, object]:
+    return {screen.name(): screen for screen in (QGuiApplication.screens() or []) if screen.name()}
+
+
 def _stitch(parts: list[tuple[QImage, dict]]) -> QImage:
     valid = [(image, stream) for image, stream in parts if image is not None and not image.isNull()]
     if not valid:
         raise MutterCaptureError("所有屏幕抓取失败")
     if len(valid) == 1:
         return valid[0][0]
-    min_x = min(stream["x"] for _image, stream in valid)
-    min_y = min(stream["y"] for _image, stream in valid)
-    max_x = max(stream["x"] + image.width() for image, stream in valid)
-    max_y = max(stream["y"] + image.height() for image, stream in valid)
+    screens = _screen_by_name()
+    placed: list[tuple[QImage, int, int, int, int]] = []
+    for image, stream in valid:
+        screen = screens.get(stream.get("name") or "")
+        if screen is not None:
+            geo = screen.geometry()
+            placed.append((image, geo.x(), geo.y(), geo.width(), geo.height()))
+        else:
+            placed.append((image, int(stream.get("x") or 0), int(stream.get("y") or 0), image.width(), image.height()))
+    min_x = min(x for _image, x, _y, _w, _h in placed)
+    min_y = min(y for _image, _x, y, _w, _h in placed)
+    max_x = max(x + w for _image, x, _y, w, _h in placed)
+    max_y = max(y + h for _image, _x, y, _w, h in placed)
     canvas = QPixmap(max(1, max_x - min_x), max(1, max_y - min_y))
     canvas.fill(QColor(0, 0, 0))
     painter = QPainter(canvas)
-    for image, stream in valid:
-        painter.drawImage(stream["x"] - min_x, stream["y"] - min_y, image)
+    for image, x, y, w, h in placed:
+        if image.width() != w or image.height() != h:
+            painter.drawImage(x - min_x, y - min_y, image.scaled(w, h))
+        else:
+            painter.drawImage(x - min_x, y - min_y, image)
     painter.end()
     return canvas.toImage()

@@ -166,11 +166,13 @@ def split_by_screens(full: QImage, monitors: list[Monitor] | None = None) -> lis
     if len(monitors) == 1:
         return [ScreenShot(monitors[0].screen, full, monitors[0].logical)]
 
-    single = _match_single_monitor(full, monitors)
-    if single is not None:
-        return [single]
-
+    virtual = _bounds([m.logical for m in monitors]).size()
     image = QSize(full.width(), full.height())
+    if _score(virtual, image) > 0.2:
+        single = _match_single_monitor(full, monitors)
+        if single is not None:
+            return [single]
+
     best = min(_candidates(monitors), key=lambda c: _score(c.canvas, image))
     if _score(best.canvas, image) > 0.08:
         logical = [m.logical for m in monitors]

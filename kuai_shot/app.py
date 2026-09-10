@@ -9,11 +9,11 @@ from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from . import APP_ID, APP_NAME, HOTKEY_LABEL
-from .capture import CaptureError, capture_fullscreen
+from .capture import CaptureError, capture_shots, start_grabber
 from .display import probe_monitors, split_by_screens
 from .hotkey import register_gnome_hotkey, write_application_desktop, write_autostart
 from .ipc import CommandServer, send_command
-from .overlay import OverlaySession
+from .overlay_gtk import OverlaySession, ensure_gtk, pump_gtk
 from .paths import install_root
 from .permission import grant_screenshot_permission
 
@@ -22,11 +22,17 @@ class ShotApp(QObject):
     def __init__(self, qt: QApplication):
         super().__init__()
         self.qt = qt
-        self.session: OverlaySession | None = None
+        self.session = None
         self.pins: list = []
         self._busy = False
+        self._portal_job: dict | None = None
         self.server = CommandServer(self._on_ipc)
         self.server.start()
+        start_grabber()
+        ensure_gtk()
+        self._glib = QTimer()
+        self._glib.timeout.connect(pump_gtk)
+        self._glib.start(5)
         self.tray = self._make_tray()
         qt.screenAdded.connect(lambda *_: None)
         qt.screenRemoved.connect(self._on_screens_changed)
@@ -73,18 +79,39 @@ class ShotApp(QObject):
 
     def _on_ipc(self, cmd: str) -> None:
         if cmd == "capture":
-            QTimer.singleShot(0, self.start_capture)
+            self._arm_capture()
         elif cmd == "quit":
             QTimer.singleShot(0, self.quit)
 
-    def start_capture(self) -> None:
+    def _arm_capture(self) -> None:
         if self.session is not None or self._busy:
+            return
+        if self._portal_job is None:
+            try:
+                self._portal_job = start_grabber().submit()
+            except Exception:
+                self._portal_job = None
+        QTimer.singleShot(0, self.start_capture)
+
+    def start_capture(self) -> None:
+        if self.session is not None:
+            return
+        if self._busy and self._portal_job is None:
             return
         self._busy = True
         try:
             monitors = probe_monitors()
-            full = capture_fullscreen()
-            shots = split_by_screens(full, monitors)
+            job = self._portal_job
+            self._portal_job = None
+            shots = []
+            if job is not None:
+                try:
+                    full = start_grabber().wait_image(job, timeout=4.0)
+                    shots = split_by_screens(full, monitors)
+                except CaptureError:
+                    shots = []
+            if not shots:
+                shots = capture_shots(monitors, skip_portal=job is not None)
             if not shots:
                 raise CaptureError("没有可用的屏幕")
             self.session = OverlaySession(shots)
