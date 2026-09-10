@@ -80,7 +80,18 @@ class PortalGrabber:
                 box["uri"] = grab_uri(timeout_sec=8, connection=conn)
             except Exception as exc:
                 box["error"] = str(exc)
+            if box.get("abandoned"):
+                _safe_unlink(_uri_to_path(str(box.get("uri") or "")))
             box["done"].set()
+
+    def abandon(self, box: dict) -> None:
+        box["abandoned"] = True
+
+    def stop(self) -> None:
+        try:
+            self._jobs.put_nowait(None)
+        except Exception:
+            pass
 
     def submit(self) -> dict:
         if not self._ready.wait(2):
@@ -90,8 +101,13 @@ class PortalGrabber:
         return box
 
     def wait_box(self, box: dict, timeout: float = 10.0) -> str:
+        if box.get("abandoned"):
+            raise CaptureError("截图已取消")
         if not box["done"].wait(timeout):
+            self.abandon(box)
             raise CaptureError("截图超时")
+        if box.get("abandoned"):
+            raise CaptureError("截图已取消")
         if box["error"]:
             raise CaptureError(box["error"])
         return str(box["uri"])

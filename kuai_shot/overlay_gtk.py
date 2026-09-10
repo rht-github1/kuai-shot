@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import threading
 from datetime import datetime
 from dataclasses import dataclass, field
 
@@ -25,6 +24,23 @@ from .windows import TopWindow, _init_atspi, list_visible_windows, window_at
 _GTK_READY = False
 TOOLS = ["rect", "ellipse", "arrow", "pen", "highlight", "mosaic", "text", "step"]
 BAR_KINDS = TOOLS + ["undo", "redo", "long", "save", "pin", "ok", "cancel"]
+BAR_TIPS = {
+    "rect": "矩形",
+    "ellipse": "椭圆",
+    "arrow": "箭头",
+    "pen": "画笔",
+    "highlight": "高亮",
+    "mosaic": "马赛克",
+    "text": "文字  ·  [ ] 调字号",
+    "step": "序号钉",
+    "undo": "撤销  Ctrl+Z",
+    "redo": "重做  Ctrl+Y",
+    "long": "长图  L",
+    "save": "保存  Ctrl+S",
+    "pin": "复制并钉在最上层",
+    "ok": "复制到剪贴板  Enter",
+    "cancel": "取消  Esc",
+}
 HANDLE_NAMES = ("nw", "n", "ne", "e", "se", "s", "sw", "w")
 HANDLE_CURSORS = {
     "nw": "nw-resize",
@@ -47,6 +63,32 @@ COLORS = [
     (255, 255, 255),
     (31, 35, 41),
 ]
+
+
+def inspect_toolbar_hit(bar_slots, color_slots, x, y):
+    if bar_slots:
+        px, py, total, bh, items = bar_slots
+        if py <= y <= py + bh and px <= x <= px + total:
+            for kind, sx, bw in items:
+                if sx <= x <= sx + bw:
+                    return ("btn", kind, sx + bw / 2, py, bh)
+    if color_slots:
+        cy, items = color_slots
+        if cy <= y <= cy + 16:
+            for rgb, cx, _cy in items:
+                if cx <= x <= cx + 18:
+                    return ("color", rgb, cx + 9, cy, 16)
+    return None
+
+
+def toolbar_tip_text(hit) -> str:
+    if hit is None:
+        return ""
+    kind = hit[0]
+    if kind == "btn":
+        return BAR_TIPS.get(hit[1], "")
+    rgb = hit[1]
+    return f"颜色  #{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
 
 
 def ensure_gtk() -> None:
@@ -161,6 +203,10 @@ def copy_image(image: QImage) -> None:
         try:
             path = cache_dir() / "last-clip.png"
             path.write_bytes(png)
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
             event("clip.file", path=str(path), bytes=len(png))
         except Exception as exc:
             exception("clip.file", exc)
@@ -232,8 +278,10 @@ class Stroke:
 
 
 class PinWindow:
-    def __init__(self, pixbuf: GdkPixbuf.Pixbuf):
+    def __init__(self, pixbuf: GdkPixbuf.Pixbuf, on_close=None):
         ensure_gtk()
+        self._on_close = on_close
+        self._closed = False
         display = Gdk.Display.get_default()
         mon = display.get_monitor_at_point(0, 0) if display else None
         max_w, max_h = 1200, 800
@@ -265,10 +313,29 @@ class PinWindow:
         )
         self.win.connect("button-press-event", self._on_press)
         self.win.connect("button-release-event", self._on_release)
+        self.win.connect("destroy", lambda *_: self._notify_close())
         self.win.show_all()
         self.win.present()
 
+    def set_on_close(self, on_close) -> None:
+        self._on_close = on_close
+
+    def _notify_close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.pixbuf = None
+        cb = self._on_close
+        self._on_close = None
+        if cb is not None:
+            try:
+                cb(self)
+            except Exception:
+                pass
+
     def _on_draw(self, _w, cr):
+        if self.pixbuf is None:
+            return False
         Gdk.cairo_set_source_pixbuf(cr, self.pixbuf, 0, 0)
         cr.paint()
         cr.set_source_rgb(0.20, 0.44, 1)
@@ -347,6 +414,7 @@ class GtkOverlay:
             | Gdk.EventMask.POINTER_MOTION_MASK
             | Gdk.EventMask.KEY_PRESS_MASK
             | Gdk.EventMask.ENTER_NOTIFY_MASK
+            | Gdk.EventMask.LEAVE_NOTIFY_MASK
             | Gdk.EventMask.SCROLL_MASK
             | Gdk.EventMask.SMOOTH_SCROLL_MASK
         )
@@ -369,6 +437,7 @@ class GtkOverlay:
             widget.connect("motion-notify-event", self._on_motion)
             widget.connect("scroll-event", self._on_scroll)
         self.win.connect("enter-notify-event", self._on_enter)
+        self.win.connect("leave-notify-event", self._on_leave)
         self.win.connect("key-press-event", self._on_key)
         self.win.connect("delete-event", self._on_delete)
         self.win.connect("realize", self._on_realize)
@@ -426,6 +495,7 @@ class GtkOverlay:
             | Gdk.EventMask.POINTER_MOTION_MASK
             | Gdk.EventMask.KEY_PRESS_MASK
             | Gdk.EventMask.ENTER_NOTIFY_MASK
+            | Gdk.EventMask.LEAVE_NOTIFY_MASK
             | Gdk.EventMask.SCROLL_MASK
             | Gdk.EventMask.SMOOTH_SCROLL_MASK
         )
@@ -722,6 +792,20 @@ class GtkOverlay:
         slots = []
         for i, kind in enumerate(kinds):
             if i in seps:
+                cursor += 10
+            bw = self._kind_width(kind)
+            slots.append((kind, cursor, bw))
+            cursor += bw
+        cy = py + bh + 6
+        color_slots = [(rgb, px + i * 20, cy) for i, rgb in enumerate(COLORS)]
+        self._bar_slots = (px, py, total, bh, slots)
+        self._color_slots = (cy, color_slots)
+        hover_hit = inspect_toolbar_hit(self._bar_slots, self._color_slots, self._hud[0], self._hud[1])
+        hover_kind = hover_hit[1] if hover_hit and hover_hit[0] == "btn" else None
+        hover_rgb = hover_hit[1] if hover_hit and hover_hit[0] == "color" else None
+        cursor = px + pad
+        for i, kind in enumerate(kinds):
+            if i in seps:
                 cr.set_source_rgba(1, 1, 1, 0.12)
                 cr.set_line_width(1)
                 cr.move_to(cursor + 5, py + 10)
@@ -729,7 +813,6 @@ class GtkOverlay:
                 cr.stroke()
                 cursor += 10
             bw = self._kind_width(kind)
-            slots.append((kind, cursor, bw))
             active = kind == self.tool
             if active:
                 self._round_rect(cr, cursor + 3, py + 4, bw - 6, bh - 8, 8)
@@ -747,6 +830,10 @@ class GtkOverlay:
                 self._round_rect(cr, cursor + 3, py + 4, bw - 6, bh - 8, 8)
                 cr.set_source_rgba(0.96, 0.32, 0.36, 0.16)
                 cr.fill()
+            if hover_kind == kind and not active:
+                self._round_rect(cr, cursor + 3, py + 4, bw - 6, bh - 8, 8)
+                cr.set_source_rgba(1, 1, 1, 0.12)
+                cr.fill()
             if kind == "long":
                 cr.set_source_rgb(1, 1, 1)
                 cr.select_font_face("Sans")
@@ -757,11 +844,7 @@ class GtkOverlay:
             else:
                 self._draw_icon(cr, kind, cursor + (bw - 20) / 2, py + (bh - 20) / 2, active)
             cursor += bw
-        self._bar_slots = (px, py, total, bh, slots)
-        cy = py + bh + 6
-        cx = px
-        color_slots = []
-        for rgb in COLORS:
+        for rgb, cx, _cy in color_slots:
             cr.set_source_rgb(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255)
             cr.arc(cx + 8, cy + 8, 7, 0, math.tau)
             cr.fill()
@@ -770,9 +853,43 @@ class GtkOverlay:
                 cr.set_line_width(1.6)
                 cr.arc(cx + 8, cy + 8, 8.2, 0, math.tau)
                 cr.stroke()
-            color_slots.append((rgb, cx, cy))
-            cx += 20
-        self._color_slots = (cy, color_slots)
+            elif rgb == hover_rgb:
+                cr.set_source_rgba(1, 1, 1, 0.7)
+                cr.set_line_width(1.4)
+                cr.arc(cx + 8, cy + 8, 8.2, 0, math.tau)
+                cr.stroke()
+        self._draw_bar_tip(cr, win_w, win_h)
+
+    def _draw_bar_tip(self, cr, win_w, win_h) -> None:
+        hit = inspect_toolbar_hit(self._bar_slots, self._color_slots, self._hud[0], self._hud[1])
+        text = toolbar_tip_text(hit)
+        if not text or hit is None:
+            return
+        _kind, _payload, cx, iy, ih = hit
+        self._draw_tooltip(cr, text, cx, iy, ih, win_w, win_h)
+
+    def _draw_tooltip(self, cr, text: str, cx: float, item_y: float, item_h: float, win_w: float, win_h: float) -> None:
+        cr.select_font_face("Sans")
+        cr.set_font_size(12)
+        ext = cr.text_extents(text)
+        pad_x, pad_y = 8, 5
+        tw = ext.width + pad_x * 2
+        th = ext.height + pad_y * 2
+        tx = min(win_w - tw - 8, max(8, cx - tw / 2))
+        ty = item_y - th - 8
+        if ty < 8:
+            ty = item_y + item_h + 8
+            if ty + th > win_h - 8:
+                ty = max(8, win_h - th - 8)
+        self._round_rect(cr, tx, ty, tw, th, 6)
+        cr.set_source_rgba(0.07, 0.09, 0.12, 0.96)
+        cr.fill_preserve()
+        cr.set_source_rgba(0.55, 0.62, 0.72, 0.55)
+        cr.set_line_width(1)
+        cr.stroke()
+        cr.set_source_rgb(0.93, 0.95, 0.97)
+        cr.move_to(tx + pad_x - ext.x_bearing, ty + pad_y - ext.y_bearing)
+        cr.show_text(text)
 
     def _draw_long_bar(self, cr, win_w, win_h, sx, sy, x, y, w, h):
         items = (("ok", "完成", 72), ("cancel", "取消", 64))
@@ -1003,24 +1120,16 @@ class GtkOverlay:
         iy = vy * self.img_h / vis_h
         return ix, iy
 
-    def _hit_bar(self, x, y) -> str | None:
-        slots = self._bar_slots
-        if slots:
-            px, py, total, bh, items = slots
-            if py <= y <= py + bh and px <= x <= px + total:
-                for kind, sx, bw in items:
-                    if sx <= x <= sx + bw:
-                        return kind
-        colors = self._color_slots
-        if colors:
-            cy, items = colors
-            if cy <= y <= cy + 16:
-                for rgb, cx, _cy in items:
-                    if cx <= x <= cx + 18:
-                        self.color = rgb
-                        self.da.queue_draw()
-                        return "color"
-        return None
+    def _hit_bar(self, x, y, apply: bool = False) -> str | None:
+        hit = inspect_toolbar_hit(self._bar_slots, self._color_slots, x, y)
+        if hit is None:
+            return None
+        if hit[0] == "color":
+            if apply:
+                self.color = hit[1]
+                self.da.queue_draw()
+            return "color"
+        return hit[1]
 
     def _dup_event(self, ev) -> bool:
         key = (int(ev.time), int(ev.type), int(getattr(ev, "button", 0)), round(ev.x, 1), round(ev.y, 1))
@@ -1031,6 +1140,13 @@ class GtkOverlay:
 
     def _on_enter(self, _w, ev):
         self.session.note_active(self)
+        return False
+
+    def _on_leave(self, _w, ev):
+        if getattr(ev, "detail", None) == Gdk.NotifyType.INFERIOR:
+            return False
+        self._hud = (0.0, 0.0, 0.0, 0.0)
+        self.da.queue_draw()
         return False
 
     def _on_scroll(self, widget, ev) -> bool:
@@ -1117,7 +1233,20 @@ class GtkOverlay:
             pass
 
     def grab_keys(self) -> None:
-        return
+        if self._seat is not None or self.closed:
+            return
+        try:
+            gdk_win = self.win.get_window()
+            display = self.win.get_display()
+            if gdk_win is None or display is None:
+                return
+            seat = display.get_default_seat()
+            if seat is None:
+                return
+            seat.grab(gdk_win, Gdk.SeatCapabilities.KEYBOARD, True, None, None, None)
+            self._seat = seat
+        except Exception:
+            self._seat = None
 
     def ungrab_keys(self) -> None:
         if self._seat is None:
@@ -1195,7 +1324,7 @@ class GtkOverlay:
         if ev.button != 1:
             return False
         vx, vy = self._event_xy(widget, ev)
-        hit = self._hit_bar(vx, vy)
+        hit = self._hit_bar(vx, vy, apply=True)
         if hit == "color":
             return True
         if hit is not None:
@@ -1263,7 +1392,9 @@ class GtkOverlay:
         handle = self._hit_handle(ix, iy)
         vx, vy = self._event_xy(widget, ev)
         self._hud = (vx, vy, ix, iy)
-        if handle in HANDLE_CURSORS:
+        if inspect_toolbar_hit(self._bar_slots, self._color_slots, vx, vy) is not None:
+            self._set_cursor("pointer")
+        elif handle in HANDLE_CURSORS:
             self._set_cursor(HANDLE_CURSORS[handle])
         else:
             self._set_cursor("crosshair")
@@ -1396,6 +1527,7 @@ class GtkOverlay:
             self.win.destroy()
         except Exception:
             pass
+        self.pixbuf = None
 
     def _on_key(self, _w, ev):
         if self._entry is not None:
@@ -1476,27 +1608,34 @@ class OverlaySession(QObject):
         self._long_scroll_armed = False
         self._panel = None
         pump_gtk()
-        for shot in shots:
-            overlay = GtkOverlay(shot, self)
-            self._used_monitors.add(overlay.mon_idx)
-            self.overlays.append(overlay)
-            pump_gtk()
+        try:
+            for shot in shots:
+                overlay = GtkOverlay(shot, self)
+                self._used_monitors.add(overlay.mon_idx)
+                self.overlays.append(overlay)
+                pump_gtk()
+        except Exception:
+            for overlay in self.overlays:
+                try:
+                    overlay.destroy_quiet()
+                except Exception:
+                    pass
+            self.overlays.clear()
+            raise
         if self.overlays:
             self.active = self.overlays[0]
         _init_atspi()
         bounds = QRect(self.desktop_bounds()) if self.overlays else QRect()
         monitors = self.monitor_rects()
-        threading.Thread(
-            target=self._load_windows,
-            args=(bounds, monitors),
-            name="kuai-shot-windows",
-            daemon=True,
-        ).start()
+        GLib.idle_add(self._load_windows_idle, bounds, monitors)
+        GLib.idle_add(self._grab_owner_keys)
 
     def monitor_rects(self) -> list[QRect]:
         return [QRect(overlay.desk) for overlay in self.overlays]
 
-    def _load_windows(self, bounds: QRect, monitors: list[QRect]) -> None:
+    def _load_windows_idle(self, bounds: QRect, monitors: list[QRect]) -> bool:
+        if self._emitted:
+            return False
         try:
             windows = list_visible_windows(
                 bounds if bounds.width() > 0 else None,
@@ -1504,10 +1643,15 @@ class OverlaySession(QObject):
             )
         except Exception:
             windows = []
-        GLib.idle_add(self._set_windows, windows)
-
-    def _set_windows(self, windows: list[TopWindow]) -> bool:
         self.windows = windows
+        return False
+
+    def _grab_owner_keys(self) -> bool:
+        if self._emitted:
+            return False
+        owner = self.toolbar_owner() or (self.overlays[0] if self.overlays else None)
+        if owner is not None and not owner.closed:
+            owner.grab_keys()
         return False
 
     def note_active(self, overlay: GtkOverlay) -> None:
@@ -1797,8 +1941,12 @@ class OverlaySession(QObject):
         pix = qimage_to_pixbuf(image)
         self.pin = pin
         if pin:
-            self.pins.append(PinWindow(pix))
+            self.pins.append(PinWindow(pix, on_close=self._drop_pin))
         self.finish(image)
+
+    def _drop_pin(self, pin) -> None:
+        if pin in self.pins:
+            self.pins.remove(pin)
 
     def save(self) -> None:
         if not self.ready:

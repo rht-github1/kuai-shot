@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from PyQt5.QtGui import QColor, QImage, QPainter
 
+MAX_CANVAS = 16384
+
 
 def _row_sig(image: QImage, y: int) -> tuple[int, ...]:
     w = image.width()
@@ -611,29 +613,149 @@ def _gap_strip(image: QImage, axis: str, size: int = 4) -> QImage:
     return strip
 
 
+def _match_frame(canvas: QImage, nxt: QImage, axis: str) -> QImage:
+    frame = nxt.convertToFormat(QImage.Format_RGB32)
+    if axis == "h" and frame.height() != canvas.height() and frame.height() > 0:
+        return frame.scaled(max(1, int(frame.width() * canvas.height() / frame.height())), canvas.height())
+    if axis != "h" and frame.width() != canvas.width() and frame.width() > 0:
+        return frame.scaled(canvas.width(), max(1, int(frame.height() * canvas.width() / frame.width())))
+    return frame
+
+
+def shift_strip(canvas: QImage, nxt: QImage, shift: int, axis: str = "v") -> tuple[QImage, str] | None:
+    """Pixels newly revealed by `shift`. Side is append (positive) or prepend."""
+    if canvas is None or canvas.isNull() or nxt is None or nxt.isNull() or shift == 0:
+        return None
+    frame = _match_frame(canvas, nxt, axis)
+    if axis == "h":
+        if shift > 0:
+            add = frame.copy(max(0, frame.width() - shift), 0, min(shift, frame.width()), frame.height())
+            return add, "append"
+        add = frame.copy(0, 0, min(-shift, frame.width()), frame.height())
+        return add, "prepend"
+    if shift > 0:
+        add = frame.copy(0, max(0, frame.height() - shift), frame.width(), min(shift, frame.height()))
+        return add, "append"
+    add = frame.copy(0, 0, frame.width(), min(-shift, frame.height()))
+    return add, "prepend"
+
+
 def extend_unwrapped(canvas: QImage, nxt: QImage, shift: int | None, axis: str = "v") -> QImage:
     """Grow canvas by the newly revealed strip of nxt. None shift inserts a visible gap."""
     if canvas is None or canvas.isNull():
         return nxt.convertToFormat(QImage.Format_RGB32) if nxt is not None and not nxt.isNull() else canvas
     if nxt is None or nxt.isNull():
         return canvas
-    frame = nxt.convertToFormat(QImage.Format_RGB32)
-    if axis == "h" and frame.height() != canvas.height() and frame.height() > 0:
-        frame = frame.scaled(max(1, int(frame.width() * canvas.height() / frame.height())), canvas.height())
-    elif axis != "h" and frame.width() != canvas.width() and frame.width() > 0:
-        frame = frame.scaled(canvas.width(), max(1, int(frame.height() * canvas.width() / frame.width())))
+    frame = _match_frame(canvas, nxt, axis)
     if shift is None:
         return _stack(_stack(canvas, _gap_strip(frame, axis), axis), frame, axis)
     if shift == 0:
         return canvas
-    if axis == "h":
-        if shift > 0:
-            add = frame.copy(max(0, frame.width() - shift), 0, min(shift, frame.width()), frame.height())
-            return _stack(canvas, add, "h")
-        add = frame.copy(0, 0, min(-shift, frame.width()), frame.height())
-        return _stack(add, canvas, "h")
-    if shift > 0:
-        add = frame.copy(0, max(0, frame.height() - shift), frame.width(), min(shift, frame.height()))
-        return _stack(canvas, add, "v")
-    add = frame.copy(0, 0, frame.width(), min(-shift, frame.height()))
-    return _stack(add, canvas, "v")
+    piece = shift_strip(canvas, nxt, shift, axis)
+    if piece is None:
+        return canvas
+    add, side = piece
+    if side == "append":
+        return _stack(canvas, add, axis)
+    return _stack(add, canvas, axis)
+
+
+class GrowingCanvas:
+    """Same pixels as repeated extend_unwrapped, without recopying the whole image each step."""
+
+    def __init__(self, seed: QImage, axis: str = "v"):
+        self.axis = "h" if axis == "h" else "v"
+        frame = seed.convertToFormat(QImage.Format_RGB32)
+        self.used = frame.width() if self.axis == "h" else frame.height()
+        cap = min(MAX_CANVAS, max(self.used * 2, self.used + 512))
+        if self.axis == "h":
+            self.buf = QImage(max(1, cap), max(1, frame.height()), QImage.Format_RGB32)
+        else:
+            self.buf = QImage(max(1, frame.width()), max(1, cap), QImage.Format_RGB32)
+        self.buf.fill(QColor(0, 0, 0))
+        painter = QPainter(self.buf)
+        painter.drawImage(0, 0, frame)
+        painter.end()
+
+    def snapshot(self) -> QImage:
+        if self.buf is None or self.buf.isNull() or self.used < 1:
+            return QImage()
+        if self.axis == "h":
+            return self.buf.copy(0, 0, max(1, self.used), self.buf.height())
+        return self.buf.copy(0, 0, self.buf.width(), max(1, self.used))
+
+    def would_exceed(self, extra: int) -> bool:
+        return self.used + max(0, extra) > MAX_CANVAS
+
+    def extend(self, nxt: QImage, shift: int | None) -> bool:
+        current = self.snapshot()
+        if shift is None:
+            grown = extend_unwrapped(current, nxt, None, self.axis)
+            return self._replace(grown)
+        if shift == 0:
+            return True
+        piece = shift_strip(current, nxt, shift, self.axis)
+        if piece is None:
+            return True
+        add, side = piece
+        extra = add.width() if self.axis == "h" else add.height()
+        if extra < 1:
+            return True
+        if self.would_exceed(extra):
+            return False
+        if not self._ensure(self.used + extra, side, extra):
+            return False
+        painter = QPainter(self.buf)
+        if self.axis == "h":
+            x = 0 if side == "prepend" else self.used - extra
+            painter.drawImage(x, 0, add)
+        else:
+            y = 0 if side == "prepend" else self.used - extra
+            painter.drawImage(0, y, add)
+        painter.end()
+        return True
+
+    def _replace(self, image: QImage) -> bool:
+        if image is None or image.isNull():
+            return False
+        span = image.width() if self.axis == "h" else image.height()
+        if span > MAX_CANVAS:
+            return False
+        self.axis = "h" if self.axis == "h" else "v"
+        self.used = span
+        if self.axis == "h":
+            self.buf = QImage(max(span, self.buf.width()), image.height(), QImage.Format_RGB32)
+        else:
+            self.buf = QImage(image.width(), max(span, self.buf.height()), QImage.Format_RGB32)
+        self.buf.fill(QColor(0, 0, 0))
+        painter = QPainter(self.buf)
+        painter.drawImage(0, 0, image)
+        painter.end()
+        self.used = span
+        return True
+
+    def _ensure(self, need: int, side: str, extra: int) -> bool:
+        cap = self.buf.width() if self.axis == "h" else self.buf.height()
+        if need > MAX_CANVAS:
+            return False
+        grow = need > cap
+        new_cap = min(MAX_CANVAS, max(need, cap * 2)) if grow else cap
+        if not grow and side != "prepend":
+            self.used = need
+            return True
+        nxt = QImage(
+            new_cap if self.axis == "h" else self.buf.width(),
+            self.buf.height() if self.axis == "h" else new_cap,
+            QImage.Format_RGB32,
+        )
+        nxt.fill(QColor(0, 0, 0))
+        painter = QPainter(nxt)
+        origin = extra if side == "prepend" else 0
+        if self.axis == "h":
+            painter.drawImage(origin, 0, self.buf, 0, 0, self.used, self.buf.height())
+        else:
+            painter.drawImage(0, origin, self.buf, 0, 0, self.buf.width(), self.used)
+        painter.end()
+        self.buf = nxt
+        self.used = need
+        return True

@@ -7,6 +7,8 @@ import uuid
 
 from gi.repository import Gio, GLib
 
+from .glibutil import attach_timeout, close_connection, destroy_source, unsubscribe
+
 
 def _session_connection() -> Gio.DBusConnection:
     addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
@@ -23,6 +25,7 @@ def _session_connection() -> Gio.DBusConnection:
 
 def grab_uri(timeout_sec: int = 8, connection: Gio.DBusConnection | None = None) -> str:
     owns_ctx = False
+    owns_bus = connection is None
     ctx = GLib.MainContext.get_thread_default()
     if ctx is None:
         ctx = GLib.MainContext.new()
@@ -35,6 +38,8 @@ def grab_uri(timeout_sec: int = 8, connection: Gio.DBusConnection | None = None)
     sender = unique[1:].replace(".", "_")
     token = f"kuaishot{uuid.uuid4().hex[:10]}"
     handle = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    sub_id = None
+    timer = None
 
     def on_signal(_conn, _sender, _path, _iface, signal, parameters):
         if signal != "Response":
@@ -46,40 +51,49 @@ def grab_uri(timeout_sec: int = 8, connection: Gio.DBusConnection | None = None)
             box["error"] = f"portal Response={code}"
         loop.quit()
 
-    bus.signal_subscribe(
-        None,
-        "org.freedesktop.portal.Request",
-        "Response",
-        handle,
-        None,
-        Gio.DBusSignalFlags.NONE,
-        on_signal,
-    )
-    proxy = Gio.DBusProxy.new_sync(
-        bus,
-        Gio.DBusProxyFlags.NONE,
-        None,
-        "org.freedesktop.portal.Desktop",
-        "/org/freedesktop/portal/desktop",
-        "org.freedesktop.portal.Screenshot",
-        None,
-    )
-    options = {
-        "interactive": GLib.Variant("b", False),
-        "modal": GLib.Variant("b", False),
-        "handle_token": GLib.Variant("s", token),
-    }
-    proxy.call_sync(
-        "Screenshot",
-        GLib.Variant("(sa{sv})", ("", options)),
-        Gio.DBusCallFlags.NONE,
-        15000,
-        None,
-    )
-    GLib.timeout_add_seconds(timeout_sec, loop.quit)
-    loop.run()
-    if owns_ctx:
-        ctx.pop_thread_default()
+    try:
+        sub_id = bus.signal_subscribe(
+            None,
+            "org.freedesktop.portal.Request",
+            "Response",
+            handle,
+            None,
+            Gio.DBusSignalFlags.NONE,
+            on_signal,
+        )
+        proxy = Gio.DBusProxy.new_sync(
+            bus,
+            Gio.DBusProxyFlags.NONE,
+            None,
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Screenshot",
+            None,
+        )
+        options = {
+            "interactive": GLib.Variant("b", False),
+            "modal": GLib.Variant("b", False),
+            "handle_token": GLib.Variant("s", token),
+        }
+        proxy.call_sync(
+            "Screenshot",
+            GLib.Variant("(sa{sv})", ("", options)),
+            Gio.DBusCallFlags.NONE,
+            15000,
+            None,
+        )
+        timer = attach_timeout(ctx, max(1, int(timeout_sec)) * 1000, loop.quit)
+        loop.run()
+    finally:
+        destroy_source(timer)
+        unsubscribe(bus, sub_id)
+        if owns_ctx:
+            try:
+                ctx.pop_thread_default()
+            except Exception:
+                pass
+        if owns_bus:
+            close_connection(bus)
     if box["error"]:
         raise RuntimeError(box["error"])
     if not box["uri"]:

@@ -6,6 +6,8 @@ import threading
 from PyQt5.QtCore import QRect
 from PyQt5.QtGui import QColor, QGuiApplication, QImage, QPainter, QPixmap
 
+from .glibutil import attach_idle, attach_timeout, close_connection, destroy_source, unsubscribe
+
 
 class MutterCaptureError(RuntimeError):
     pass
@@ -17,7 +19,7 @@ def capture_monitors(include_cursor: bool = False) -> QImage:
 
 
 def capture_monitor_frames(include_cursor: bool = False) -> list[dict]:
-    box: dict = {"frames": None, "error": ""}
+    box: dict = {"frames": None, "error": "", "caster": None}
     thread = threading.Thread(
         target=_capture_thread,
         args=(include_cursor, box),
@@ -27,6 +29,13 @@ def capture_monitor_frames(include_cursor: bool = False) -> list[dict]:
     thread.start()
     thread.join(12)
     if thread.is_alive():
+        caster = box.get("caster")
+        if caster is not None:
+            try:
+                caster.request_stop()
+            except Exception:
+                pass
+        thread.join(4)
         raise MutterCaptureError("Mutter 截图超时")
     if box["error"]:
         raise MutterCaptureError(box["error"])
@@ -37,8 +46,10 @@ def capture_monitor_frames(include_cursor: bool = False) -> list[dict]:
 
 
 def _capture_thread(include_cursor: bool, box: dict) -> None:
+    caster = RegionCaster()
+    box["caster"] = caster
     try:
-        box["frames"] = _capture_frames_with_glib(include_cursor)
+        box["frames"] = _capture_frames_with_glib(include_cursor, caster)
     except Exception as exc:
         box["error"] = str(exc)
 
@@ -56,6 +67,10 @@ class RegionCaster:
         self._primed = False
         self._started = False
         self._area: QRect | None = None
+        self._sub_id = None
+        self._timer = None
+        self._loop = None
+        self._halt = False
 
     def start(
         self,
@@ -65,12 +80,16 @@ class RegionCaster:
     ) -> None:
         if self._started:
             return
+        if self._halt:
+            raise MutterCaptureError("ScreenCast 已停止")
         if area is not None and area.width() >= 8 and area.height() >= 8:
             try:
                 self._boot(include_cursor=include_cursor, names=None, area=QRect(area))
                 return
             except Exception:
                 self.stop()
+        if self._halt:
+            raise MutterCaptureError("ScreenCast 已停止")
         self._boot(include_cursor=include_cursor, names=names, area=None)
 
     def _boot(
@@ -152,6 +171,7 @@ class RegionCaster:
 
             pending = {item["path"]: item for item in streams}
             loop = GLib.MainLoop(self._ctx)
+            self._loop = loop
 
             def on_signal(_c, _s, path, _iface, signal, parameters):
                 if signal != "PipeWireStreamAdded" or path not in pending:
@@ -161,7 +181,7 @@ class RegionCaster:
                 if all(item["node"] is not None for item in streams):
                     loop.quit()
 
-            self._conn.signal_subscribe(
+            self._sub_id = self._conn.signal_subscribe(
                 None,
                 "org.gnome.Mutter.ScreenCast.Stream",
                 "PipeWireStreamAdded",
@@ -170,9 +190,16 @@ class RegionCaster:
                 Gio.DBusSignalFlags.NONE,
                 on_signal,
             )
-            GLib.timeout_add(2000, loop.quit)
+            self._timer = attach_timeout(self._ctx, 2000, loop.quit)
             self._sess.call_sync("Start", None, Gio.DBusCallFlags.NONE, 4000, None)
             loop.run()
+            destroy_source(self._timer)
+            self._timer = None
+            self._loop = None
+            unsubscribe(self._conn, self._sub_id)
+            self._sub_id = None
+            if self._halt:
+                raise MutterCaptureError("ScreenCast 已停止")
             missing = [item["name"] for item in streams if item["node"] is None]
             if missing:
                 raise MutterCaptureError("PipeWire 节点未就绪: " + ", ".join(missing))
@@ -210,6 +237,8 @@ class RegionCaster:
         self._primed = False
 
     def grab_frames(self, timeout_ms: int | None = None, reuse_last: bool = True) -> list[dict]:
+        if self._halt:
+            return []
         if not self._started:
             raise MutterCaptureError("ScreenCast 未启动")
         if not self._pipes:
@@ -239,29 +268,53 @@ class RegionCaster:
         self._primed = True
         return frames
 
+    def request_stop(self) -> None:
+        self._halt = True
+        ctx = self._ctx
+        loop = self._loop
+        if loop is not None:
+            try:
+                loop.quit()
+            except Exception:
+                pass
+        if ctx is not None:
+            attach_idle(ctx, self.stop)
+
     def stop(self) -> None:
+        destroy_source(self._timer)
+        self._timer = None
+        if self._loop is not None:
+            try:
+                self._loop.quit()
+            except Exception:
+                pass
+            self._loop = None
+        unsubscribe(self._conn, self._sub_id)
+        self._sub_id = None
         self._close_pipes()
         self._last.clear()
         if self._sess is not None:
             try:
-                self._sess.call_sync("Stop", None, Gio.DBusCallFlags.NONE, 4000, None)
+                self._sess.call_sync("Stop", None, Gio.DBusCallFlags.NONE, 2000, None)
             except Exception:
                 pass
         self._sess = None
         self._streams = []
         self._started = False
         self._area = None
+        conn = self._conn
+        self._conn = None
         if self._ctx is not None:
             try:
                 self._ctx.pop_thread_default()
             except Exception:
                 pass
             self._ctx = None
-        self._conn = None
+        close_connection(conn)
 
 
-def _capture_frames_with_glib(include_cursor: bool) -> list[dict]:
-    caster = RegionCaster()
+def _capture_frames_with_glib(include_cursor: bool, caster: RegionCaster | None = None) -> list[dict]:
+    caster = caster if caster is not None else RegionCaster()
     try:
         caster.start(include_cursor=include_cursor)
         return caster.grab_frames()
@@ -369,7 +422,7 @@ def _gst_open(node_id: int):
     pipeline = Gst.parse_launch(
         f"pipewiresrc path={int(node_id)} do-timestamp=true ! "
         "videoconvert ! video/x-raw,format=RGBA ! "
-        "appsink name=sink max-buffers=24 drop=false sync=false"
+        "appsink name=sink max-buffers=2 drop=true sync=false"
     )
     sink = pipeline.get_by_name("sink")
     if sink is None:

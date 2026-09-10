@@ -11,6 +11,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
 from kuai_shot.stitch import (
+    GrowingCanvas,
     _pick_row_shift,
     estimate_shift,
     extend_unwrapped,
@@ -138,6 +139,39 @@ class StitchTests(unittest.TestCase):
         out = extend_unwrapped(a, b, None, "v")
         self.assertEqual(out.width(), a.width())
         self.assertGreater(out.height(), a.height() + b.height())
+
+    def test_growing_canvas_matches_extend(self) -> None:
+        doc = QImage(48, 160, QImage.Format_RGB32)
+        painter = QPainter(doc)
+        for y in range(160):
+            painter.fillRect(0, y, 48, 1, QColor(12 + y, 40, 90 + (y % 80)))
+        painter.end()
+        first = doc.copy(0, 0, 48, 50)
+        grown = GrowingCanvas(first, "v")
+        expected = first.convertToFormat(QImage.Format_RGB32)
+        for y0, dy in ((18, 14), (32, 16), (50, 12)):
+            nxt = doc.copy(0, y0, 48, 50)
+            expected = extend_unwrapped(expected, nxt, dy, "v")
+            self.assertTrue(grown.extend(nxt, dy))
+            got = grown.snapshot()
+            self.assertEqual(got.width(), expected.width())
+            self.assertEqual(got.height(), expected.height())
+            self.assertEqual(got.pixel(8, 3), expected.pixel(8, 3))
+            self.assertEqual(got.pixel(8, got.height() - 2), expected.pixel(8, expected.height() - 2))
+
+    def test_growing_canvas_horizontal(self) -> None:
+        left = QImage(40, 24, QImage.Format_RGB32)
+        left.fill(QColor(10, 20, 30))
+        right = QImage(40, 24, QImage.Format_RGB32)
+        right.fill(QColor(200, 40, 40))
+        grown = GrowingCanvas(left, "h")
+        self.assertTrue(grown.extend(right, 11))
+        expected = extend_unwrapped(left, right, 11, "h")
+        got = grown.snapshot()
+        self.assertEqual(got.width(), expected.width())
+        self.assertEqual(got.height(), expected.height())
+        self.assertEqual(got.pixel(2, 8), expected.pixel(2, 8))
+        self.assertEqual(got.pixel(got.width() - 2, 8), expected.pixel(expected.width() - 2, 8))
 
 
 if __name__ == "__main__":

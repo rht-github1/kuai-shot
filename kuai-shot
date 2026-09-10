@@ -43,6 +43,10 @@ def main() -> int:
         return 0
     elif args and args[0] == "ping":
         return 0 if send_command("ping") else 1
+    elif args and args[0] == "log":
+        from kuai_shot.log import apply_cli_log
+
+        return apply_cli_log(args[1:])
     elif args and args[0] == "daemon":
         pass
     elif send_command("ping"):

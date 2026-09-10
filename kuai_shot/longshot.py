@@ -23,15 +23,13 @@ from .log import event, exception
 from .mutter_capture import RegionCaster
 from .paths import pictures_dir
 from .stitch import (
+    GrowingCanvas,
     estimate_shift,
-    extend_unwrapped,
     frame_usable,
     frames_similar,
     shift_bounds,
     stitch_long,
 )
-
-MAX_CANVAS = 16384
 
 
 def last_usable(frames: list[QImage]) -> QImage | None:
@@ -55,7 +53,9 @@ class _LiveGrabber:
         self.axis = "h" if axis == "h" else "v"
         seed = canvas if canvas is not None and not canvas.isNull() else first
         self._last = first
-        self.canvas = seed.copy() if seed is not None and not seed.isNull() else None
+        self._grow: GrowingCanvas | None = None
+        if seed is not None and not seed.isNull():
+            self._grow = GrowingCanvas(seed, self.axis)
         self.gaps = 0
         self.steps = 0
         self.on_new = on_new
@@ -67,24 +67,28 @@ class _LiveGrabber:
         self._emit_at = 0.0
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._monitors = probe_monitors()
         self._thread = threading.Thread(target=self._run, name="kuai-shot-long-live", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, join_timeout: float = 5.0) -> None:
         event("long.grab.stop")
         self._stop.set()
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(join_timeout)
 
     def snapshot(self) -> QImage | None:
         with self._lock:
-            if self.canvas is None or self.canvas.isNull():
+            if self._grow is None:
                 return None
-            return self.canvas.copy()
+            image = self._grow.snapshot()
+            return None if image is None or image.isNull() else image
 
     def _run(self) -> None:
         event("long.grab.start", x=self.region.x(), y=self.region.y(), w=self.region.width(), h=self.region.height())
         caster = RegionCaster()
         try:
-            names = monitor_names_for_rect(self.region)
+            names = monitor_names_for_rect(self.region, self._monitors)
             caster.start(names=names or None, area=self.region)
             event(
                 "long.grab.caster_ok",
@@ -135,7 +139,7 @@ class _LiveGrabber:
                 if image is None or image.isNull():
                     return None
                 return image
-            shots = shots_from_frames(frames, probe_monitors())
+            shots = shots_from_frames(frames, self._monitors or probe_monitors())
             return compose_shots(shots, self.region)
         except Exception as exc:
             exception("long.grab.crop", exc)
@@ -149,17 +153,16 @@ class _LiveGrabber:
         if last is None or last.isNull():
             self._last = image
             with self._lock:
-                if self.canvas is None or self.canvas.isNull():
-                    self.canvas = image.copy()
+                self._grow = GrowingCanvas(image, self.axis)
             self._emit(True)
             return
         if not self._live_ready:
             self._live_ready = True
-            if self.canvas is None or self.canvas.isNull():
+            if self._grow is None:
                 self._last = image
                 self._settled = True
                 with self._lock:
-                    self.canvas = image.copy()
+                    self._grow = GrowingCanvas(image, self.axis)
                 event("long.grab.resync", reason="first-live-seed", w=image.width(), h=image.height())
                 self._emit(True)
                 return
@@ -203,23 +206,25 @@ class _LiveGrabber:
         self._last = image
         self._misses = 0
         with self._lock:
-            canvas = self.canvas if self.canvas is not None and not self.canvas.isNull() else last
-            grown = extend_unwrapped(canvas, image, shift, self.axis)
-            if self.axis == "h" and grown.width() > MAX_CANVAS:
-                event("long.grab.cap", w=grown.width())
+            if self._grow is None:
+                seed = last if last is not None and not last.isNull() else image
+                self._grow = GrowingCanvas(seed, self.axis)
+            if not self._grow.extend(image, shift):
+                snap = self._grow.snapshot()
+                if self.axis == "h":
+                    event("long.grab.cap", w=snap.width() if not snap.isNull() else 0)
+                else:
+                    event("long.grab.cap", h=snap.height() if not snap.isNull() else 0)
                 return
-            if self.axis != "h" and grown.height() > MAX_CANVAS:
-                event("long.grab.cap", h=grown.height())
-                return
-            self.canvas = grown
             self.steps += 1
+            snap = self._grow.snapshot()
         event(
             "long.grab.accept",
             w=image.width(),
             h=image.height(),
             shift=shift,
-            canvas_w=self.canvas.width() if self.canvas is not None else 0,
-            canvas_h=self.canvas.height() if self.canvas is not None else 0,
+            canvas_w=0 if snap.isNull() else snap.width(),
+            canvas_h=0 if snap.isNull() else snap.height(),
         )
         self._emit(False)
 
@@ -268,6 +273,9 @@ class LongShotBar(QWidget):
         save_btn = QPushButton("保存")
         copy_btn = QPushButton("✓")
         cancel_btn = QPushButton("取消")
+        save_btn.setToolTip("保存到文件并复制")
+        copy_btn.setToolTip("复制到剪贴板")
+        cancel_btn.setToolTip("取消")
         save_btn.setFixedHeight(32)
         copy_btn.setFixedHeight(32)
         cancel_btn.setFixedHeight(32)
@@ -375,11 +383,10 @@ class LongShotBar(QWidget):
     def destroy_ui(self) -> None:
         self._closed = True
         self._keep_canvas()
-        if self._grabber is not None:
-            self._grabber.stop()
-            self._grabber = None
+        self._stop_grab()
         self.hide()
         self.close()
+        self.deleteLater()
 
     def _keep_canvas(self) -> None:
         if self._grabber is None:
@@ -397,6 +404,19 @@ class LongShotBar(QWidget):
         if self._grabber is not None:
             self._grabber.stop()
             self._grabber = None
+
+    def _restart_grab(self) -> None:
+        if self._closed:
+            return
+        last = self._canvas if self._canvas is not None else (self.frames[-1] if self.frames else None)
+        self._grabber = _LiveGrabber(
+            self.region,
+            last,
+            self.frame_arrived.emit,
+            lambda: self._closed,
+            axis=self.axis,
+            canvas=self._canvas,
+        )
 
     def _copy(self) -> None:
         event("long.ui.copy", closed=int(self._closed), frames=len(self.frames))
@@ -422,22 +442,14 @@ class LongShotBar(QWidget):
         image = self.export()
         if image is None or image.isNull():
             event("long.ui.save.empty")
+            self._restart_grab()
             return
         suggested = str(pictures_dir() / datetime.now().strftime("截图-%Y%m%d-%H%M%S.png"))
         path, _ok = QFileDialog.getSaveFileName(self, "保存截图", suggested, "PNG (*.png)")
         event("long.ui.save.dialog", path=path or "")
         if not path:
-            if not self._closed:
-                last = self._canvas if self._canvas is not None else (self.frames[-1] if self.frames else None)
-                self._grabber = _LiveGrabber(
-                    self.region,
-                    last,
-                    self.frame_arrived.emit,
-                    lambda: self._closed,
-                    axis=self.axis,
-                    canvas=self._canvas,
-                )
-                event("long.ui.save.resume")
+            self._restart_grab()
+            event("long.ui.save.resume")
             return
         if not path.lower().endswith(".png"):
             path += ".png"

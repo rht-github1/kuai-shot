@@ -12,12 +12,14 @@
 - 点选窗口：能对上的会套住（接近铺满某块屏的窗口、以及坐标可信的小窗）；Wayland 不提供公开窗口位置，对不上的不会乱套，请改用拖选
 - 准星放大镜、取色（RGB / hex）、选区尺寸
 - 矩形 / 椭圆 / 箭头 / 画笔 / 高亮 / 马赛克 / 文字 / 序号钉
+- 工具栏按钮悬停显示用途和快捷键
 - 文字在图上直接输入（`Gtk.Entry`，可打中文），`[` `]` 调字号
 - 选区后长图：蓝框确认后点「长图」/`L`，或在框里滚轮。全屏遮罩只让开一次，在真页面上自己滚；第一次滚轮方向决定纵/横（点按钮则默认纵向）。控制条避开选区跟拍，对不准的帧会跳过。保存 / ✓ / 取消与普通截图相同
 - 颜色、线宽、撤销 / 重做
 - 复制到剪贴板（先关遮罩，再走 Qt + `wl-copy`，避免 Wayland 把内容清掉）；只有点保存才会写文件
 - 钉在最上层，可拖动，右键或双击关闭
 - 原图像素导出，不二次压缩、不拉伸降质
+- 调试日志默认关闭；排障时再打开，避免一直写盘
 
 ## 环境
 
@@ -98,7 +100,7 @@ KUAI_SHOT_PIP_WRITE_CONF=0 ./install.sh             # 不写 pip.conf
 python3 -m unittest discover -s tests -v
 ```
 
-覆盖 1 / 2 / 3 屏布局、跨屏拼接、窗口对位、长图位移与重叠拼接。托盘仍用 Qt，遮罩仍用 GTK，不合成一套 toolkit（Wayland 缩放下两套窗口的 DPR 不一致）。
+覆盖 1 / 2 / 3 屏布局、跨屏拼接、窗口对位、长图位移与重叠拼接、工具栏提示、日志开关。托盘仍用 Qt，遮罩仍用 GTK，不合成一套 toolkit（Wayland 缩放下两套窗口的 DPR 不一致）。
 
 ## 命令
 
@@ -107,10 +109,14 @@ kuai-shot            # 已有守护进程则直接返回；否则启动托盘
 kuai-shot capture    # 通知守护进程开始截图（快捷键走这条）
 kuai-shot ping       # 检查守护进程是否在运行
 kuai-shot quit       # 退出守护进程
+kuai-shot log on     # 打开调试日志
+kuai-shot log off    # 关闭调试日志
+kuai-shot log        # 查看当前是开还是关
 ```
 
-排障日志写在 `~/.cache/kuai-shot/kuai-shot.log`（长图进入、抓帧接受/跳过、保存/✓/取消、剪贴板）。查看：
+调试日志默认关闭，不写文件、不刷终端。需要排障时：
 
-```bash
-tail -f ~/.cache/kuai-shot/kuai-shot.log
-```
+1. 托盘右键勾选「调试日志」，或 `kuai-shot log on`
+2. `tail -f ~/.cache/kuai-shot/kuai-shot.log`
+
+开关会写入 `~/.config/kuai-shot/debug-log`，守护进程不用重启。也可用 `KUAI_SHOT_LOG=1` 临时强制打开。
