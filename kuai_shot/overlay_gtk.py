@@ -1475,10 +1475,12 @@ class OverlaySession(QObject):
         self._long_follow = False
         self._long_scroll_armed = False
         self._panel = None
+        pump_gtk()
         for shot in shots:
             overlay = GtkOverlay(shot, self)
             self._used_monitors.add(overlay.mon_idx)
             self.overlays.append(overlay)
+            pump_gtk()
         if self.overlays:
             self.active = self.overlays[0]
         _init_atspi()

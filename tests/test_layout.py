@@ -12,7 +12,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 os.environ.setdefault("KUAI_SHOT_HOME", ROOT)
 
-from kuai_shot.display import Monitor, best_layout, monitor_names_for_rect, split_by_screens
+from kuai_shot.display import Monitor, best_layout, monitor_names_for_rect, place_rect_away, split_by_screens
 
 
 def _app() -> QApplication:
@@ -79,6 +79,14 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(monitor_names_for_rect(QRect(3572, 732, 762, 279), mons), ["DP-3"])
         self.assertEqual(monitor_names_for_rect(QRect(10, 10, 100, 100), mons), ["eDP-1"])
         self.assertEqual(monitor_names_for_rect(QRect(2800, 400, 200, 200), mons), ["eDP-1", "DP-3"])
+
+    def test_place_rect_away_from_region(self) -> None:
+        region = QRect(100, 80, 240, 160)
+        bounds = QRect(0, 0, 1280, 800)
+        pos = place_rect_away(region, QSize(200, 120), bounds)
+        box = QRect(pos, QSize(200, 120))
+        self.assertTrue(bounds.contains(box))
+        self.assertTrue(box.intersected(region).isEmpty())
 
 
 if __name__ == "__main__":

@@ -11,10 +11,12 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
 from kuai_shot.stitch import (
+    _pick_row_shift,
     estimate_shift,
     extend_unwrapped,
     frames_similar,
     overlap_rows,
+    pick_verified_shift,
     stitch_horizontal,
     stitch_vertical,
 )
@@ -111,6 +113,15 @@ class StitchTests(unittest.TestCase):
         out = extend_unwrapped(prev, nxt, dy, "v")
         self.assertEqual(out.width(), 64)
         self.assertGreaterEqual(out.height(), 56 + 15)
+
+    def test_jitter_does_not_beat_real_scroll(self) -> None:
+        self.assertEqual(pick_verified_shift([2, -2, 50, 100], 50, 300), 50)
+        self.assertEqual(pick_verified_shift([2, -2], 2, 193), 0)
+        self.assertEqual(pick_verified_shift([50, 250], 250, 376), 50)
+        self.assertEqual(pick_verified_shift([50, 285], 285, 380), 50)
+        self.assertEqual(pick_verified_shift([12, 13, 50], None, 296), 50)
+        self.assertEqual(pick_verified_shift([-26, 24, 50], None, 324), 50)
+        self.assertEqual(_pick_row_shift([(20, 94), (22, 50), (30, 76), (80, 40)]), 50)
 
     def test_same_viewport_is_not_a_jump(self) -> None:
         frame = QImage(64, 80, QImage.Format_RGB32)

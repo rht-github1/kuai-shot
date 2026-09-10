@@ -18,16 +18,16 @@ from PyQt5.QtWidgets import (
 
 from .capture import shots_from_frames
 from .compose import compose_shots
-from .display import monitor_names_for_rect, probe_monitors
+from .display import available_bounds_for, monitor_names_for_rect, place_rect_away, probe_monitors
 from .log import event, exception
 from .mutter_capture import RegionCaster
 from .paths import pictures_dir
 from .stitch import (
-    canvas_viewport,
     estimate_shift,
     extend_unwrapped,
     frame_usable,
     frames_similar,
+    shift_bounds,
     stitch_long,
 )
 
@@ -60,9 +60,10 @@ class _LiveGrabber:
         self.steps = 0
         self.on_new = on_new
         self.paused = paused
-        self._dir = 0
         self._live_ready = False
         self._misses = 0
+        self._dir = 1
+        self._settled = False
         self._emit_at = 0.0
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -107,15 +108,15 @@ class _LiveGrabber:
                     exception("long.grab.fail", exc)
                     frames = []
                 image = self._crop(caster, frames)
-                if image is not None:
-                    self._ingest(image)
                 while not self._stop.is_set() and not self.paused():
                     extra = caster.grab_frames(timeout_ms=2, reuse_last=False)
                     if not extra:
                         break
-                    image = self._crop(caster, extra)
-                    if image is not None:
-                        self._ingest(image)
+                    nxt = self._crop(caster, extra)
+                    if nxt is not None:
+                        image = nxt
+                if image is not None:
+                    self._ingest(image)
         except Exception as exc:
             exception("long.grab.caster", exc)
         finally:
@@ -133,8 +134,6 @@ class _LiveGrabber:
                 image = frames[0].get("image")
                 if image is None or image.isNull():
                     return None
-                if image.width() != self.region.width() or image.height() != self.region.height():
-                    image = image.scaled(self.region.width(), self.region.height())
                 return image
             shots = shots_from_frames(frames, probe_monitors())
             return compose_shots(shots, self.region)
@@ -156,21 +155,31 @@ class _LiveGrabber:
             return
         if not self._live_ready:
             self._live_ready = True
-            self._last = image
-            if self.canvas is None or self.canvas.isNull() or not frames_similar(self.canvas, image, limit=18):
+            if self.canvas is None or self.canvas.isNull():
+                self._last = image
+                self._settled = True
                 with self._lock:
                     self.canvas = image.copy()
-                event("long.grab.resync", reason="first-live", w=image.width(), h=image.height())
-            else:
-                event("long.grab.resync", reason="first-live-keep", w=image.width(), h=image.height())
-            self._emit(True)
+                event("long.grab.resync", reason="first-live-seed", w=image.width(), h=image.height())
+                self._emit(True)
+                return
+            # Overlay seed stays on the canvas. Live frames become the
+            # alignment reference — portal pixels and RecordArea pixels
+            # are not the same source, so they must not be cross-matched.
+            self._last = image
+            self._settled = False
+            event("long.grab.resync", reason="keep-seed", w=image.width(), h=image.height())
             return
-        if frames_similar(last, image, limit=10):
+        if not self._settled:
+            if frames_similar(self._last, image):
+                self._settled = True
+                event("long.grab.resync", reason="live-steady", w=image.width(), h=image.height())
+            self._last = image
             return
-        with self._lock:
-            tail = canvas_viewport(self.canvas, image, self.axis)
-            tail = tail.copy() if tail is not None and not tail.isNull() else None
-        shift = estimate_shift(tail if tail is not None else last, image, self.axis)
+        last = self._last
+        if last is not None and not last.isNull() and frames_similar(last, image, limit=10):
+            return
+        shift = estimate_shift(last, image, self.axis, self._dir)
         if shift is None:
             self._misses += 1
             if self._misses >= 24:
@@ -180,13 +189,16 @@ class _LiveGrabber:
             else:
                 event("long.grab.skip", reason="no-align", w=image.width(), h=image.height(), misses=self._misses)
             return
-        if abs(shift) <= 1:
+        size = image.height() if self.axis != "h" else image.width()
+        min_step, max_shift = shift_bounds(size)
+        if abs(shift) < min_step:
             self._misses = 0
             return
-        if self._dir == 0 and abs(shift) >= 3:
-            self._dir = 1 if shift > 0 else -1
-        if self._dir and shift * self._dir < 0:
-            event("long.grab.skip", reason="reverse", shift=shift)
+        if abs(shift) > max_shift:
+            event("long.grab.skip", reason="huge", shift=shift, w=image.width(), h=image.height())
+            return
+        if shift * self._dir < 0:
+            event("long.grab.skip", reason="opp", shift=shift, w=image.width(), h=image.height())
             return
         self._last = image
         self._misses = 0
@@ -240,7 +252,6 @@ class LongShotBar(QWidget):
         self.on_copy = on_copy
         self.on_cancel = on_cancel
         self._closed = False
-        self._hover = False
         self._grabber: _LiveGrabber | None = None
 
         self.setWindowTitle("快截图 · 长图")
@@ -249,7 +260,7 @@ class LongShotBar(QWidget):
 
         self.title = QLabel(self._title())
         self.preview = QLabel()
-        self.preview.setMinimumSize(160, 90)
+        self.preview.setMinimumSize(max(160, self.region.width() // 4), max(90, self.region.height() // 3))
         hint = QLabel("对着刚才的选区滚动，长图会跟着长。对不准的帧会跳过，避免重影。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#9aa6b2;")
@@ -276,7 +287,7 @@ class LongShotBar(QWidget):
         root.addWidget(hint)
         root.addLayout(row)
         self.setStyleSheet("QWidget { background:#1a1f27; color:#e8edf2; } QPushButton { min-width:64px; }")
-        self.resize(360, 260)
+        self.resize(max(320, self.region.width() // 2), max(220, self.region.height() // 2))
         self._update_preview()
         self.frame_arrived.connect(self._on_frame)
         first = self.frames[-1] if self.frames else None
@@ -284,14 +295,15 @@ class LongShotBar(QWidget):
             self.region,
             first,
             self.frame_arrived.emit,
-            lambda: self._hover or self._closed,
+            lambda: self._closed,
             axis=self.axis,
             canvas=self._canvas,
         )
         self.show()
+        self._place_away()
         self.raise_()
         self.activateWindow()
-        event("long.bar.ready", axis=self.axis, frames=len(self.frames))
+        event("long.bar.ready", axis=self.axis, frames=len(self.frames), x=self.x(), y=self.y())
 
     def export(self) -> QImage | None:
         grabbed = None
@@ -313,21 +325,35 @@ class LongShotBar(QWidget):
         r = self.region
         return f"长图{'横向' if self.axis == 'h' else '纵向'}  ·  {r.width()}×{r.height()}"
 
-    def _update_preview(self) -> None:
-        self.title.setText(self._title())
+    def _place_away(self) -> None:
+        pos = place_rect_away(self.region, self.size(), available_bounds_for(self.region))
+        self.move(pos)
+
+    def _preview_slice(self) -> QImage | None:
         image = self._canvas
         if image is None or image.isNull():
+            return None
+        if self.axis == "h":
+            view = max(1, self.region.width())
+            if image.width() > view:
+                return image.copy(image.width() - view, 0, view, image.height())
+            return image
+        view = max(1, self.region.height())
+        if image.height() > view:
+            return image.copy(0, image.height() - view, image.width(), view)
+        return image
+
+    def _update_preview(self) -> None:
+        self.title.setText(self._title())
+        image = self._preview_slice()
+        if image is None or image.isNull():
             return
-        pix = QPixmap.fromImage(image)
-        self.preview.setPixmap(pix.scaled(280, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
-    def enterEvent(self, ev) -> None:
-        self._hover = True
-        super().enterEvent(ev)
-
-    def leaveEvent(self, ev) -> None:
-        self._hover = False
-        super().leaveEvent(ev)
+        target = self.preview.size()
+        if target.width() < 8 or target.height() < 8:
+            target = self.preview.minimumSize()
+        self.preview.setPixmap(
+            QPixmap.fromImage(image).scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
 
     def closeEvent(self, ev) -> None:
         if not self._closed:
@@ -407,7 +433,7 @@ class LongShotBar(QWidget):
                     self.region,
                     last,
                     self.frame_arrived.emit,
-                    lambda: self._hover or self._closed,
+                    lambda: self._closed,
                     axis=self.axis,
                     canvas=self._canvas,
                 )

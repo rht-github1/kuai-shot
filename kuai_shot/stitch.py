@@ -214,30 +214,150 @@ def _prep_pair(prev: QImage, nxt: QImage, axis: str) -> tuple[QImage, QImage] | 
     return a, b
 
 
-def estimate_shift(prev: QImage, nxt: QImage, axis: str = "v") -> int | None:
+def estimate_shift(prev: QImage, nxt: QImage, axis: str = "v", direction: int = 1) -> int | None:
     """How far content moved from prev to nxt.
 
     Vertical: +shift means content moved up, new rows are at the bottom of nxt.
     Horizontal: +shift means content moved left, new columns are at the right of nxt.
     None means the two frames cannot be aligned.
+    direction: +1 keep only that sign (default down / right for 长图).
     """
     pair = _prep_pair(prev, nxt, axis)
     if pair is None:
         return None
     a, b = pair
+    if frames_similar(a, b, limit=8):
+        return 0
     kind = "h" if axis == "h" else "v"
-    candidates = _profile_candidates(_edges(_luma_profile(a, kind)), _edges(_luma_profile(b, kind)))
-    if not candidates:
-        candidates = _profile_candidates(_luma_profile(a, kind), _luma_profile(b, kind))
-    if not candidates:
+    signed = 1 if direction >= 0 else -1
+    by_rows = _shift_by_rows(a, b, kind, signed)
+    if by_rows is not None:
+        return by_rows
+    full_a = _luma_profile(a, kind)
+    full_b = _luma_profile(b, kind)
+    pa, pb = _trim_static(full_a, full_b)
+    peak = None
+    pool: list[int] = []
+    for left, right in ((_edges(pa), _edges(pb)), (pa, pb)):
+        found = _norm_xcorr_peak(left, right)
+        if found is not None:
+            if peak is None:
+                peak = found
+            pool.extend(range(found - 2, found + 3))
+        pool.extend(delta for delta, _score in _profile_candidates(left, right))
+    seen: set[int] = set()
+    verified: list[int] = []
+    for delta in pool:
+        if delta in seen or delta * signed <= 0:
+            continue
+        seen.add(delta)
+        if _verify_profiles(full_a, full_b, delta):
+            verified.append(delta)
+    return pick_verified_shift(verified, peak, min(len(full_a), len(full_b)))
+
+
+def shift_bounds(size: int) -> tuple[int, int]:
+    """Min/max move as a fraction of the viewport, not a fixed pixel step."""
+    size = max(1, size)
+    min_step = max(1, size // 16)
+    return min_step, max(min_step, (size * 2) // 3)
+
+
+def pick_verified_shift(verified: list[int], peak: int | None, size: int) -> int | None:
+    """Keep real scroll, drop capture jitter. Do not hard-code a wheel step."""
+    if not verified:
         return None
-    floor = candidates[0][1]
-    for delta, score in candidates:
-        if score > floor + 3:
-            break
-        if verify_shift(a, b, delta, kind):
-            return delta
-    return None
+    min_step, max_shift = shift_bounds(size)
+    moved = [delta for delta in verified if min_step <= abs(delta) <= max_shift]
+    if not moved:
+        return 0
+    forward = sorted(delta for delta in moved if delta > 0)
+    if not forward:
+        return 0
+    chosen = forward[0]
+    rest = [delta for delta in forward if delta >= chosen * 2]
+    if rest and chosen * 8 < size:
+        return min(rest)
+    return chosen
+
+
+def _shift_by_rows(prev: QImage, nxt: QImage, axis: str, direction: int) -> int | None:
+    if axis == "h":
+        return None
+    h = min(prev.height(), nxt.height())
+    min_step, max_shift = shift_bounds(h)
+    hi = min(max_shift, h - 12)
+    if hi < min_step:
+        return None
+    packed_a = _luma_bytes(prev)
+    packed_b = _luma_bytes(nxt)
+    if packed_a is None or packed_b is None:
+        sa = [_row_sig(prev, y) for y in range(h)]
+        sb = [_row_sig(nxt, y) for y in range(h)]
+    else:
+        ra, ia = packed_a
+        rb, ib = packed_b
+        sa = [_row_sig_fast(ra, ia.bytesPerLine(), y, ia.width()) for y in range(h)]
+        sb = [_row_sig_fast(rb, ib.bytesPerLine(), y, ib.width()) for y in range(h)]
+    stride = 1 if h <= min_step * 5 else 2
+    sign = 1 if direction >= 0 else -1
+    ranked: list[tuple[int, int]] = []
+    for mag in range(min_step, hi + 1, stride):
+        dy = mag * sign
+        score = _row_score(sa, sb, dy)
+        if score is not None:
+            ranked.append((score, dy))
+    picked = _pick_row_shift(ranked)
+    if picked is None or stride == 1:
+        return picked
+    neighbors: list[tuple[int, int]] = []
+    for extra in (-1, 0, 1):
+        dy = picked + extra
+        if min_step <= abs(dy) <= hi:
+            score = _row_score(sa, sb, dy)
+            if score is not None:
+                neighbors.append((score, dy))
+    return _pick_row_shift(neighbors) or picked
+
+
+def _row_score(prev_rows: list[tuple[int, ...]], nxt_rows: list[tuple[int, ...]], dy: int) -> int | None:
+    h = min(len(prev_rows), len(nxt_rows))
+    ov = h - abs(dy)
+    if ov < 12:
+        return None
+    acc = n = 0
+    if dy > 0:
+        for i in range(0, ov, 2):
+            acc += _sig_diff(prev_rows[dy + i], nxt_rows[i])
+            n += 1
+    else:
+        for i in range(0, ov, 2):
+            acc += _sig_diff(prev_rows[i], nxt_rows[-dy + i])
+            n += 1
+    if n == 0:
+        return None
+    return acc // n
+
+
+def _pick_row_shift(ranked: list[tuple[int, int]]) -> int | None:
+    if not ranked:
+        return None
+    ranked = sorted(ranked)
+    distinct: list[tuple[int, int]] = []
+    for score, dy in ranked:
+        if any(abs(dy - other) <= 2 for _, other in distinct):
+            continue
+        distinct.append((score, dy))
+    best_score, best_dy = distinct[0]
+    if len(distinct) > 1:
+        band = max(1, best_score // 3)
+        if distinct[1][0] <= best_score + band:
+            near = [dy for score, dy in distinct if score <= best_score + band]
+            return min(near, key=abs)
+    mid = ranked[len(ranked) // 2][0]
+    if mid > 0 and best_score * 2 >= mid:
+        return None
+    return best_dy
 
 
 def canvas_viewport(canvas: QImage | None, frame: QImage, axis: str = "v") -> QImage | None:
@@ -264,36 +384,97 @@ def verify_shift(prev: QImage, nxt: QImage, shift: int, axis: str = "v") -> bool
     if pair is None:
         return False
     a, b = pair
+    return _verify_profiles(_luma_profile(a, axis), _luma_profile(b, axis), shift)
+
+
+def _verify_profiles(prev: list[int], nxt: list[int], shift: int) -> bool:
+    n = min(len(prev), len(nxt))
+    if n < 12:
+        return False
     if shift == 0:
-        return _band_diff(a, b, 0, 0, a.height() if axis != "h" else a.width(), axis) <= 14
-    if axis == "h":
-        w = min(a.width(), b.width())
-        if shift > 0:
-            ov = w - shift
-            return ov >= 12 and _band_diff(a, b, shift, 0, ov, "h") <= 16
-        ov = w + shift
-        return ov >= 12 and _band_diff(a, b, 0, -shift, ov, "h") <= 16
-    h = min(a.height(), b.height())
+        return _profile_band(prev, nxt, 0, 0, n) <= 14
     if shift > 0:
-        ov = h - shift
-        return ov >= 12 and _band_diff(a, b, shift, 0, ov, "v") <= 16
-    ov = h + shift
-    return ov >= 12 and _band_diff(a, b, 0, -shift, ov, "v") <= 16
+        ov = n - shift
+        return ov >= 12 and _profile_band(prev, nxt, shift, 0, ov) <= 16
+    ov = n + shift
+    return ov >= 12 and _profile_band(prev, nxt, 0, -shift, ov) <= 16
 
 
-def _band_diff(prev: QImage, nxt: QImage, prev_off: int, nxt_off: int, length: int, axis: str) -> int:
-    pa = _luma_profile(prev, axis)
-    pb = _luma_profile(nxt, axis)
+def _profile_band(prev: list[int], nxt: list[int], prev_off: int, nxt_off: int, length: int) -> int:
     acc = n = 0
     for i in range(max(0, length)):
         ia, ib = prev_off + i, nxt_off + i
-        if 0 <= ia < len(pa) and 0 <= ib < len(pb):
-            acc += abs(pa[ia] - pb[ib])
+        if 0 <= ia < len(prev) and 0 <= ib < len(nxt):
+            acc += abs(prev[ia] - nxt[ib])
             n += 1
     return acc // max(1, n)
 
 
+def _row_sig_fast(raw: memoryview, bpl: int, y: int, w: int) -> tuple[int, ...]:
+    parts: list[int] = []
+    row = y * bpl
+    for t in range(3):
+        x0 = t * w // 3
+        x1 = max(x0 + 1, (t + 1) * w // 3)
+        step = max(1, (x1 - x0) // 16)
+        r = g = b = n = 0
+        for x in range(x0, x1, step):
+            i = row + x * 4
+            b += raw[i]
+            g += raw[i + 1]
+            r += raw[i + 2]
+            n += 1
+        n = max(1, n)
+        parts.extend((r // n, g // n, b // n))
+    return tuple(parts)
+
+
+def _luma_bytes(image: QImage) -> tuple[memoryview, QImage] | None:
+    img = image.convertToFormat(QImage.Format_RGB32)
+    try:
+        bits = img.bits()
+        if bits is None:
+            return None
+        bits.setsize(img.byteCount())
+        return memoryview(bits), img
+    except Exception:
+        return None
+
+
 def _luma_profile(image: QImage, axis: str) -> list[int]:
+    packed = _luma_bytes(image)
+    if packed is None:
+        return _luma_profile_slow(image, axis)
+    raw, img = packed
+    w, h = img.width(), img.height()
+    bpl = img.bytesPerLine()
+    profile: list[int] = []
+    if axis == "h":
+        y0, y1 = h // 8, h - h // 8
+        step_y = max(1, (y1 - y0) // 20)
+        for x in range(w):
+            acc = n = 0
+            off = x * 4
+            for y in range(y0, max(y0 + 1, y1), step_y):
+                i = y * bpl + off
+                acc += (raw[i + 2] * 3 + raw[i + 1] * 6 + raw[i]) // 10
+                n += 1
+            profile.append(acc // max(1, n))
+        return profile
+    x0, x1 = w // 8, w - w // 8
+    step_x = max(1, (x1 - x0) // 20)
+    for y in range(h):
+        acc = n = 0
+        row = y * bpl
+        for x in range(x0, max(x0 + 1, x1), step_x):
+            i = row + x * 4
+            acc += (raw[i + 2] * 3 + raw[i + 1] * 6 + raw[i]) // 10
+            n += 1
+        profile.append(acc // max(1, n))
+    return profile
+
+
+def _luma_profile_slow(image: QImage, axis: str) -> list[int]:
     w, h = image.width(), image.height()
     profile: list[int] = []
     if axis == "h":
@@ -319,6 +500,61 @@ def _luma_profile(image: QImage, axis: str) -> list[int]:
     return profile
 
 
+def _trim_static(prev: list[int], nxt: list[int]) -> tuple[list[int], list[int]]:
+    n = min(len(prev), len(nxt))
+    prev, nxt = prev[:n], nxt[:n]
+    if n < 12:
+        return prev, nxt
+    diffs = [abs(prev[i] - nxt[i]) for i in range(n)]
+    avg = sum(diffs) / n
+    thr = max(3, avg)
+    hits = [i for i, item in enumerate(diffs) if item >= thr]
+    if len(hits) < 12:
+        return prev, nxt
+    lo, hi = hits[0], hits[-1] + 1
+    if hi - lo < 12:
+        return prev, nxt
+    return prev[lo:hi], nxt[lo:hi]
+
+
+def _center(values: list[int]) -> list[float]:
+    if not values:
+        return []
+    mean = sum(values) / len(values)
+    return [item - mean for item in values]
+
+
+def _norm_xcorr_peak(prev: list[int], nxt: list[int]) -> int | None:
+    a = _center(prev)
+    b = _center(nxt)
+    n = min(len(a), len(b))
+    if n < 16:
+        return None
+    min_ov = max(16, n // 4)
+    stride = 2 if n > 96 else 1
+    ranked: list[tuple[float, int]] = []
+    for delta in range(-(n - min_ov), n - min_ov + 1, stride):
+        num = na = nb = 0.0
+        count = 0
+        for i in range(0, n, stride):
+            j = i + delta
+            if 0 <= j < n:
+                num += b[i] * a[j]
+                na += a[j] * a[j]
+                nb += b[i] * b[i]
+                count += 1
+        if count < max(8, min_ov // stride) or na <= 1e-6 or nb <= 1e-6:
+            continue
+        ranked.append((num / ((na**0.5) * (nb**0.5)), delta))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (-item[0], abs(item[1])))
+    best_corr, best_delta = ranked[0]
+    if best_corr < 0.45:
+        return None
+    return best_delta
+
+
 def _edges(profile: list[int]) -> list[int]:
     if len(profile) < 3:
         return profile
@@ -330,21 +566,22 @@ def _profile_candidates(prev: list[int], nxt: list[int]) -> list[tuple[int, int]
     if n < 16:
         return []
     min_ov = max(24, n // 3)
+    stride = 2 if n > 96 else 1
     found: list[tuple[int, int]] = []
-    for delta in range(-(n - min_ov), n - min_ov + 1):
+    for delta in range(-(n - min_ov), n - min_ov + 1, stride):
         score = count = 0
-        for i in range(n):
+        for i in range(0, n, stride):
             j = i + delta
             if 0 <= j < n:
                 score += abs(nxt[i] - prev[j])
                 count += 1
-        if count < min_ov:
+        if count < max(8, min_ov // stride):
             continue
         score //= count
         if score <= 24:
             found.append((delta, score))
     found.sort(key=lambda item: (item[1], abs(item[0])))
-    return found
+    return found[:8]
 
 
 def _stack(first: QImage, second: QImage, axis: str) -> QImage:

@@ -251,6 +251,60 @@ def monitor_names_for_rect(rect: QRect, monitors: list[Monitor] | None = None) -
     return names
 
 
+def _intersect_area(a: QRect, b: QRect) -> int:
+    inter = a.intersected(b)
+    return max(0, inter.width()) * max(0, inter.height())
+
+
+def place_rect_away(region: QRect, size: QSize, bounds: QRect, gap: int | None = None) -> QPoint:
+    """Put a window of `size` inside `bounds`, preferring no overlap with `region`."""
+    w, h = max(1, size.width()), max(1, size.height())
+    if bounds.width() < 1 or bounds.height() < 1:
+        return QPoint(region.x(), region.y())
+    if gap is None:
+        gap = max(8, min(w, h) // 16)
+    options = [
+        QPoint(region.right() + gap + 1, region.top()),
+        QPoint(region.left() - gap - w, region.top()),
+        QPoint(region.left(), region.bottom() + gap + 1),
+        QPoint(region.left(), region.top() - gap - h),
+        QPoint(bounds.right() - w + 1, bounds.top()),
+        QPoint(bounds.left(), bounds.bottom() - h + 1),
+    ]
+    best = QPoint(
+        min(max(bounds.left(), region.right() + gap + 1), max(bounds.left(), bounds.right() - w + 1)),
+        min(max(bounds.top(), region.top()), max(bounds.top(), bounds.bottom() - h + 1)),
+    )
+    best_overlap = 10**9
+    for raw in options:
+        x = min(max(raw.x(), bounds.left()), max(bounds.left(), bounds.right() - w + 1))
+        y = min(max(raw.y(), bounds.top()), max(bounds.top(), bounds.bottom() - h + 1))
+        box = QRect(x, y, w, h)
+        overlap = _intersect_area(box, region)
+        if overlap == 0:
+            return box.topLeft()
+        if overlap < best_overlap:
+            best_overlap = overlap
+            best = box.topLeft()
+    return best
+
+
+def available_bounds_for(region: QRect) -> QRect:
+    screens = list(QGuiApplication.screens() or [])
+    if not screens:
+        pad = QSize(max(1, region.width()), max(1, region.height()))
+        return region.adjusted(-pad.width(), -pad.height(), pad.width(), pad.height())
+    center = region.center()
+    for screen in screens:
+        geo = screen.availableGeometry()
+        if geo.contains(center):
+            return QRect(geo)
+    box = QRect(screens[0].availableGeometry())
+    for screen in screens[1:]:
+        box = box.united(screen.availableGeometry())
+    return box
+
+
 def _bounds(rects: list[QRect]) -> QRect:
     box = QRect(rects[0])
     for rect in rects[1:]:

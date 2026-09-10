@@ -206,6 +206,7 @@ class RegionCaster:
             except Exception:
                 pass
         self._pipes = []
+        self._last.clear()
         self._primed = False
 
     def grab_frames(self, timeout_ms: int | None = None, reuse_last: bool = True) -> list[dict]:
@@ -240,6 +241,7 @@ class RegionCaster:
 
     def stop(self) -> None:
         self._close_pipes()
+        self._last.clear()
         if self._sess is not None:
             try:
                 self._sess.call_sync("Stop", None, Gio.DBusCallFlags.NONE, 4000, None)

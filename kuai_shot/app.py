@@ -120,6 +120,7 @@ class ShotApp(QObject):
                 shots = capture_shots(monitors, skip_portal=False)
             if not shots:
                 raise CaptureError("没有可用的屏幕")
+            pump_gtk()
             self.session = OverlaySession(shots)
             self.session.finished.connect(self._on_overlay_finished)
             event("app.capture.overlay", shots=len(shots))
