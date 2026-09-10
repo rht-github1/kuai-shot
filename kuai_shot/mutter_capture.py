@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 
+from PyQt5.QtCore import QRect
 from PyQt5.QtGui import QColor, QGuiApplication, QImage, QPainter, QPixmap
 
 
@@ -54,18 +55,38 @@ class RegionCaster:
         self._last: dict[str, QImage] = {}
         self._primed = False
         self._started = False
+        self._area: QRect | None = None
 
-    def start(self, names: list[str] | None = None, include_cursor: bool = False) -> None:
-        from gi.repository import Gio, GLib
-
+    def start(
+        self,
+        names: list[str] | None = None,
+        include_cursor: bool = False,
+        area: QRect | None = None,
+    ) -> None:
         if self._started:
             return
+        if area is not None and area.width() >= 8 and area.height() >= 8:
+            try:
+                self._boot(include_cursor=include_cursor, names=None, area=QRect(area))
+                return
+            except Exception:
+                self.stop()
+        self._boot(include_cursor=include_cursor, names=names, area=None)
+
+    def _boot(
+        self,
+        include_cursor: bool = False,
+        names: list[str] | None = None,
+        area: QRect | None = None,
+    ) -> None:
+        from gi.repository import Gio, GLib
+
         self._ctx = GLib.MainContext.new()
         self._ctx.push_thread_default()
         try:
             self._conn = _session_connection()
             connectors = _pick_connectors(self._conn, names)
-            if not connectors:
+            if not connectors and area is None:
                 raise MutterCaptureError("没有可录制的显示器")
 
             cast = Gio.DBusProxy.new_sync(
@@ -96,15 +117,38 @@ class RegionCaster:
             cursor_mode = 1 if include_cursor else 0
             props = {"cursor-mode": GLib.Variant("u", cursor_mode)}
             streams: list[dict] = []
-            for name in connectors:
+            if area is not None:
                 path = self._sess.call_sync(
-                    "RecordMonitor",
-                    GLib.Variant("(sa{sv})", (name, props)),
+                    "RecordArea",
+                    GLib.Variant(
+                        "(iiiia{sv})",
+                        (int(area.x()), int(area.y()), int(area.width()), int(area.height()), props),
+                    ),
                     Gio.DBusCallFlags.NONE,
                     4000,
                     None,
                 ).unpack()[0]
-                streams.append({"path": path, "name": name, "node": None, "x": 0, "y": 0})
+                streams.append(
+                    {
+                        "path": path,
+                        "name": "area",
+                        "node": None,
+                        "x": int(area.x()),
+                        "y": int(area.y()),
+                    }
+                )
+                self._area = QRect(area)
+            else:
+                self._area = None
+                for name in connectors:
+                    path = self._sess.call_sync(
+                        "RecordMonitor",
+                        GLib.Variant("(sa{sv})", (name, props)),
+                        Gio.DBusCallFlags.NONE,
+                        4000,
+                        None,
+                    ).unpack()[0]
+                    streams.append({"path": path, "name": name, "node": None, "x": 0, "y": 0})
 
             pending = {item["path"]: item for item in streams}
             loop = GLib.MainLoop(self._ctx)
@@ -164,22 +208,24 @@ class RegionCaster:
         self._pipes = []
         self._primed = False
 
-    def grab_frames(self) -> list[dict]:
+    def grab_frames(self, timeout_ms: int | None = None, reuse_last: bool = True) -> list[dict]:
         if not self._started:
             raise MutterCaptureError("ScreenCast 未启动")
         if not self._pipes:
             self._open_pipes()
         timeout = 800 if not self._primed else 120
+        if timeout_ms is not None:
+            timeout = timeout_ms
         frames = []
         for entry in self._pipes:
             item = entry["item"]
-            image = None
-            try:
-                image = _gst_pull(entry["sink"], timeout)
-            except Exception:
+            image = _gst_try_pull(entry["sink"], timeout)
+            if image is None and reuse_last:
                 image = self._last.get(item["name"])
             if image is None:
-                raise MutterCaptureError("PipeWire 没有输出帧")
+                if reuse_last:
+                    raise MutterCaptureError("PipeWire 没有输出帧")
+                return []
             self._last[item["name"]] = image
             frames.append(
                 {
@@ -202,6 +248,7 @@ class RegionCaster:
         self._sess = None
         self._streams = []
         self._started = False
+        self._area = None
         if self._ctx is not None:
             try:
                 self._ctx.pop_thread_default()
@@ -320,7 +367,7 @@ def _gst_open(node_id: int):
     pipeline = Gst.parse_launch(
         f"pipewiresrc path={int(node_id)} do-timestamp=true ! "
         "videoconvert ! video/x-raw,format=RGBA ! "
-        "appsink name=sink max-buffers=2 drop=true sync=false"
+        "appsink name=sink max-buffers=24 drop=false sync=false"
     )
     sink = pipeline.get_by_name("sink")
     if sink is None:
@@ -328,6 +375,13 @@ def _gst_open(node_id: int):
         raise MutterCaptureError("GStreamer appsink 不可用")
     pipeline.set_state(Gst.State.PLAYING)
     return pipeline, sink
+
+
+def _gst_try_pull(sink, timeout_ms: int) -> QImage | None:
+    try:
+        return _gst_pull(sink, timeout_ms)
+    except MutterCaptureError:
+        return None
 
 
 def _gst_pull(sink, timeout_ms: int) -> QImage:

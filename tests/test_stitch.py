@@ -10,7 +10,14 @@ from PyQt5.QtWidgets import QApplication
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
-from kuai_shot.stitch import frames_similar, overlap_rows, stitch_horizontal, stitch_vertical
+from kuai_shot.stitch import (
+    estimate_shift,
+    extend_unwrapped,
+    frames_similar,
+    overlap_rows,
+    stitch_horizontal,
+    stitch_vertical,
+)
 
 
 def _app() -> QApplication:
@@ -81,6 +88,45 @@ class StitchTests(unittest.TestCase):
         self.assertEqual(out.height(), 40)
         self.assertGreater(out.width(), left.width())
         self.assertLess(out.width(), left.width() + right.width())
+
+    def test_estimate_and_unwrap_vertical(self) -> None:
+        doc = QImage(64, 180, QImage.Format_RGB32)
+        painter = QPainter(doc)
+        for y in range(180):
+            painter.fillRect(
+                0,
+                y,
+                64,
+                1,
+                QColor(20 + (y * 13) % 200, 30 + (y * 7) % 180, 40 + (y * 3) % 150),
+            )
+        painter.end()
+        prev = doc.copy(0, 24, 64, 56)
+        nxt = doc.copy(0, 24 + 17, 64, 56)
+        dy = estimate_shift(prev, nxt, "v")
+        self.assertIsNotNone(dy)
+        assert dy is not None
+        self.assertGreaterEqual(dy, 15)
+        self.assertLessEqual(dy, 19)
+        out = extend_unwrapped(prev, nxt, dy, "v")
+        self.assertEqual(out.width(), 64)
+        self.assertGreaterEqual(out.height(), 56 + 15)
+
+    def test_same_viewport_is_not_a_jump(self) -> None:
+        frame = QImage(64, 80, QImage.Format_RGB32)
+        painter = QPainter(frame)
+        for y in range(80):
+            painter.fillRect(0, y, 64, 1, QColor(30 + y, 40, 80))
+        painter.end()
+        dy = estimate_shift(frame, frame.copy(), "v")
+        self.assertTrue(dy is None or abs(dy) <= 1)
+
+    def test_unwrap_gap_when_unaligned(self) -> None:
+        a = _band(40, QColor(20, 80, 20))
+        b = _band(40, QColor(180, 30, 30))
+        out = extend_unwrapped(a, b, None, "v")
+        self.assertEqual(out.width(), a.width())
+        self.assertGreater(out.height(), a.height() + b.height())
 
 
 if __name__ == "__main__":
